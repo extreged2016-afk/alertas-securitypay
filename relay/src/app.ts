@@ -61,13 +61,13 @@ export interface BuiltApp {
  * persisted in the database's meta table and in DATA_DIR/api_key (mode 0600), so
  * the operator can read it once. Requests are checked against its hash.
  */
-function resolveApiKey(cfg: Config, db: Db): { apiKey: string; generated: boolean } {
+async function resolveApiKey(cfg: Config, db: Db): Promise<{ apiKey: string; generated: boolean }> {
   if (cfg.apiKey) {
     if (!cfg.apiKey.startsWith("ak_")) throw new Error("SECURITYPAY_API_KEY must start with ak_");
     return { apiKey: cfg.apiKey, generated: false };
   }
   let generated = false;
-  const apiKey = metaOrInit(db, "api_key", () => {
+  const apiKey = await metaOrInit(db, "api_key", () => {
     generated = true;
     return randomToken("ak");
   });
@@ -82,16 +82,16 @@ function resolveApiKey(cfg: Config, db: Db): { apiKey: string; generated: boolea
 }
 
 export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<BuiltApp> {
-  const db = openDatabase(dbPath(cfg));
-  const relayId = metaOrInit(db, "relay_id", () => newId("rly"));
-  const jwtSecret = metaOrInit(db, "jwt_secret", () => randomBytes(32).toString("base64url"));
+  const db = await openDatabase(dbPath(cfg));
+  const relayId = await metaOrInit(db, "relay_id", () => newId("rly"));
+  const jwtSecret = await metaOrInit(db, "jwt_secret", () => randomBytes(32).toString("base64url"));
   let apiKey = "";
   let generated = false;
   let apiKeyHash: () => Buffer;
   if (opts.tenant) {
     apiKeyHash = opts.tenant.apiKeyHash;
   } else {
-    ({ apiKey, generated } = resolveApiKey(cfg, db));
+    ({ apiKey, generated } = await resolveApiKey(cfg, db));
     const hash = sha256(apiKey);
     apiKeyHash = () => hash;
   }
@@ -129,8 +129,8 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
   ctx.calls = calls;
   events.setVisibility((e, p) => calls.eventVisibleTo(e, p));
 
-  const dispatcher = new PushDispatcher(db, provider, relayId, app.log, (id) => {
-    const c = calls.get(id);
+  const dispatcher = new PushDispatcher(db, provider, relayId, app.log, async (id) => {
+    const c = await calls.get(id);
     return c && { direction: c.direction, device_ids: targetsOf(c) };
   });
   events.onEvent((e) => dispatcher.handle(e));
@@ -178,7 +178,7 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
   app.addHook("onClose", async () => {
     calls.stop();
     ctx.hub.closeAll();
-    db.close();
+    await db.close();
   });
 
   return { app, ctx, apiKey, apiKeyGenerated: generated };

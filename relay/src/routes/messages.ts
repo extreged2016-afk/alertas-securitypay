@@ -35,8 +35,8 @@ const ID = { type: "string", maxLength: 64 } as const;
 export function messageRoutes(app: FastifyInstance, ctx: Ctx): void {
   const { db, events } = ctx;
   const auth = requireAuth(ctx, "agent", "device");
-  const get = (id: string) =>
-    db.prepare("SELECT * FROM messages WHERE msg_id = ?").get(id) as unknown as MessageRow | undefined;
+  const get = async (id: string) =>
+    await db.prepare("SELECT * FROM messages WHERE msg_id = ?").get(id) as unknown as MessageRow | undefined;
 
   app.post<{ Body: { text: string; reply_to?: string; client_msg_id?: string } }>(
     "/v1/messages",
@@ -63,12 +63,12 @@ export function messageRoutes(app: FastifyInstance, ctx: Ctx): void {
       const reply_to = req.body.reply_to === undefined ? undefined : wellFormed(req.body.reply_to);
 
       if (client_msg_id) {
-        const existing = db
+        const existing = await db
           .prepare("SELECT * FROM messages WHERE sender = ? AND client_msg_id = ?")
           .get(from, client_msg_id) as unknown as MessageRow | undefined;
         if (existing) return reply.code(201).send(fromRow(existing));
       }
-      checkMessage(db, ctx.limits());
+      await checkMessage(db, ctx.limits());
 
       const row: MessageRow = {
         msg_id: newId("msg"),
@@ -80,11 +80,11 @@ export function messageRoutes(app: FastifyInstance, ctx: Ctx): void {
         created_at: Date.now(),
         read_at: null,
       };
-      db.prepare(
+      await db.prepare(
         `INSERT INTO messages (msg_id, sender, text, reply_to, client_msg_id, device_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(row.msg_id, row.sender, row.text, row.reply_to, row.client_msg_id, row.device_id, row.created_at);
-      events.emit({
+      await events.emit({
         type: "msg.new",
         msg_id: row.msg_id,
         from,
@@ -137,20 +137,20 @@ export function messageRoutes(app: FastifyInstance, ctx: Ctx): void {
   );
 
   app.get<{ Params: { msg_id: string } }>("/v1/messages/:msg_id", { preHandler: auth }, async (req) => {
-    const row = get(req.params.msg_id);
+    const row = await get(req.params.msg_id);
     if (!row) throw notFound("Message");
     return fromRow(row);
   });
 
   app.post<{ Params: { msg_id: string } }>("/v1/messages/:msg_id/read", { preHandler: auth }, async (req, reply) => {
     const by = partyOf(principal(req));
-    const row = get(req.params.msg_id);
+    const row = await get(req.params.msg_id);
     // You can only mark the other party's messages as read.
     if (!row || row.sender === by) throw notFound("Message");
-    const res = db
+    const res = await db
       .prepare("UPDATE messages SET read_at = ? WHERE msg_id = ? AND read_at IS NULL")
       .run(Date.now(), row.msg_id);
-    if (res.changes === 1) events.emit({ type: "msg.read", msg_id: row.msg_id, by });
+    if (res.changes === 1) await events.emit({ type: "msg.read", msg_id: row.msg_id, by });
     return reply.code(204).send();
   });
 }

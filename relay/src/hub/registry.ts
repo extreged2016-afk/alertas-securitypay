@@ -1,5 +1,6 @@
 import { sha256 } from "../auth.js";
-import { type Db, openDatabase } from "../db/database.js";
+import { DatabaseSync } from "node:sqlite";
+import { openSqliteDatabase, SQLITE_MIGRATIONS } from "../db/database.js";
 import { randomToken } from "../ids.js";
 import { type Limits, UNLIMITED } from "../quota.js";
 
@@ -46,59 +47,59 @@ const fromRow = (r: Row): TenantRecord => ({
 
 /** The tenant registry: which tenants exist, their key hash, name, limits and state. */
 export class Registry {
-  readonly db: Db;
+  readonly db: DatabaseSync;
 
   constructor(path: string) {
-    this.db = openDatabase(path, MIGRATIONS);
+    this.db = openSqliteDatabase(path, SQLITE_MIGRATIONS);
   }
 
-  get(tenantId: string): TenantRecord | undefined {
-    const r = this.db.prepare("SELECT * FROM tenants WHERE tenant_id = ?").get(tenantId) as unknown as Row | undefined;
+  async get(tenantId: string): Promise<TenantRecord | undefined> {
+    const r = await this.db.prepare("SELECT * FROM tenants WHERE tenant_id = ?").get(tenantId) as unknown as Row | undefined;
     return r && fromRow(r);
   }
 
-  byApiKey(apiKey: string): TenantRecord | undefined {
+  async byApiKey(apiKey: string): Promise<TenantRecord | undefined> {
     const r = this.db
       .prepare("SELECT * FROM tenants WHERE api_key_hash = ?")
       .get(sha256(apiKey).toString("hex")) as unknown as Row | undefined;
     return r && fromRow(r);
   }
 
-  create(tenantId: string, agentName: string, limits: Limits): { record: TenantRecord; apiKey: string } {
+  async create(tenantId: string, agentName: string, limits: Limits): Promise<{ record: TenantRecord; apiKey: string }> {
     const apiKey = randomToken("ak");
     const now = Date.now();
-    this.db
+    await this.db
       .prepare("INSERT INTO tenants (tenant_id, api_key_hash, agent_name, limits, created_at) VALUES (?, ?, ?, ?, ?)")
       .run(tenantId, sha256(apiKey).toString("hex"), agentName, JSON.stringify(limits), now);
-    return { record: this.get(tenantId)!, apiKey };
+    return { record: (await this.get(tenantId))!, apiKey };
   }
 
-  update(tenantId: string, patch: { agent_name?: string; limits?: Limits; disabled?: boolean }): void {
+  async update(tenantId: string, patch: { agent_name?: string; limits?: Limits; disabled?: boolean }): Promise<void> {
     if (patch.agent_name !== undefined) {
-      this.db.prepare("UPDATE tenants SET agent_name = ? WHERE tenant_id = ?").run(patch.agent_name, tenantId);
+      await this.db.prepare("UPDATE tenants SET agent_name = ? WHERE tenant_id = ?").run(patch.agent_name, tenantId);
     }
     if (patch.limits !== undefined) {
-      this.db.prepare("UPDATE tenants SET limits = ? WHERE tenant_id = ?").run(JSON.stringify(patch.limits), tenantId);
+      await this.db.prepare("UPDATE tenants SET limits = ? WHERE tenant_id = ?").run(JSON.stringify(patch.limits), tenantId);
     }
     if (patch.disabled !== undefined) {
-      this.db.prepare("UPDATE tenants SET disabled = ? WHERE tenant_id = ?").run(patch.disabled ? 1 : 0, tenantId);
+      await this.db.prepare("UPDATE tenants SET disabled = ? WHERE tenant_id = ?").run(patch.disabled ? 1 : 0, tenantId);
     }
   }
 
-  rotateKey(tenantId: string): string {
+  async rotateKey(tenantId: string): Promise<string> {
     const apiKey = randomToken("ak");
-    this.db
+    await this.db
       .prepare("UPDATE tenants SET api_key_hash = ? WHERE tenant_id = ?")
       .run(sha256(apiKey).toString("hex"), tenantId);
     return apiKey;
   }
 
-  delete(tenantId: string): void {
-    this.db.prepare("DELETE FROM tenants WHERE tenant_id = ?").run(tenantId);
+  async delete(tenantId: string): Promise<void> {
+    await this.db.prepare("DELETE FROM tenants WHERE tenant_id = ?").run(tenantId);
   }
 
-  ids(): string[] {
-    return (this.db.prepare("SELECT tenant_id FROM tenants").all() as Array<{ tenant_id: string }>).map((r) => r.tenant_id);
+  async ids(): Promise<string[]> {
+    return (await this.db.prepare("SELECT tenant_id FROM tenants").all() as Array<{ tenant_id: string }>).map((r) => r.tenant_id);
   }
 
   close(): void {

@@ -102,37 +102,38 @@ export class Calls {
 
   constructor(private readonly ctx: Ctx) {}
 
-  get(callId: string): CallRow | undefined {
-    return this.ctx.db.prepare("SELECT * FROM calls WHERE call_id = ?").get(callId) as unknown as CallRow | undefined;
+  async get(callId: string): Promise<CallRow | undefined> {
+    return await this.ctx.db.prepare("SELECT * FROM calls WHERE call_id = ?").get(callId) as unknown as CallRow | undefined;
   }
 
-  open(): CallRow | undefined {
-    return this.ctx.db
+  async open(): Promise<CallRow | undefined> {
+    return await this.ctx.db
       .prepare("SELECT * FROM calls WHERE state IN ('ringing','active') ORDER BY call_id DESC LIMIT 1")
       .get() as unknown as CallRow | undefined;
   }
 
   /** After a restart: time out calls that expired while we were down and re-arm the others. */
-  resume(): void {
-    const open = this.ctx.db.prepare("SELECT * FROM calls WHERE state IN ('ringing','active')").all() as unknown as CallRow[];
+  async resume(): Promise<void> {
+    const open = await this.ctx.db.prepare("SELECT * FROM calls WHERE state IN ('ringing','active')").all() as unknown as CallRow[];
     for (const c of open) {
       this.armTimer(c);
       if (c.state === "active") this.armQuota(c.call_id);
     }
   }
 
-  private part(callId: string, deviceId: string): PartState | undefined {
-    return this.partRow(callId, deviceId)?.state;
+  private async part(callId: string, deviceId: string): Promise<PartState | undefined> {
+    const r = await this.partRow(callId, deviceId);
+    return r?.state;
   }
 
-  private partRow(callId: string, deviceId: string): { state: PartState; updated_at: number } | undefined {
-    return this.ctx.db
+  private async partRow(callId: string, deviceId: string): Promise<{ state: PartState; updated_at: number } | undefined> {
+    return await this.ctx.db
       .prepare("SELECT state, updated_at FROM call_participants WHERE call_id = ? AND device_id = ?")
       .get(callId, deviceId) as { state: PartState; updated_at: number } | undefined;
   }
 
-  private setPart(callId: string, deviceId: string, state: PartState): void {
-    this.ctx.db
+  private async setPart(callId: string, deviceId: string, state: PartState): Promise<void> {
+    await this.ctx.db
       .prepare(
         `INSERT INTO call_participants (call_id, device_id, state, updated_at) VALUES (?, ?, ?, ?)
          ON CONFLICT(call_id, device_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
@@ -140,14 +141,14 @@ export class Calls {
       .run(callId, deviceId, state, Date.now());
   }
 
-  private countParts(callId: string, ...states: PartState[]): number {
-    const r = this.ctx.db
+  private async countParts(callId: string, ...states: PartState[]): Promise<number> {
+    const r = await this.ctx.db
       .prepare(`SELECT COUNT(*) AS n FROM call_participants WHERE call_id = ? AND state IN (${states.map(() => "?").join(",")})`)
       .get(callId, ...states) as { n: number };
     return r.n;
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     for (const t of [...this.timers.values(), ...this.quotaTimers.values()]) clearTimeout(t);
     this.timers.clear();
     this.quotaTimers.clear();
@@ -158,8 +159,8 @@ export class Calls {
    * it runs out. The timer wakes at least every QUOTA_CHECK_MS, so a lowered limit, a new
    * month or a raised limit (an upgrade) are all picked up during the call.
    */
-  private armQuota(callId: string): void {
-    const left = callMsLeft(this.ctx.db, this.ctx.limits());
+  private async armQuota(callId: string): Promise<void> {
+    const left = await callMsLeft(this.ctx.db, this.ctx.limits());
     if (left === undefined || this.quotaTimers.has(callId)) return;
     if (left < 1000) {
       this.finish(callId, "active", "ended", "relay", "quota");
@@ -168,7 +169,7 @@ export class Calls {
     const t = setTimeout(() => {
       this.quotaTimers.delete(callId);
       try {
-        if (this.get(callId)?.state === "active") this.armQuota(callId);
+        void this.get(callId).then((c) => { if (c?.state === "active") this.armQuota(callId); });
       } catch (err) {
         // Timers run outside any request: an error here would end the whole process.
         this.ctx.log.error({ err, call: callId }, "call quota check failed");
@@ -179,38 +180,38 @@ export class Calls {
   }
 
   /** Limits changed (hub admin API): re-check the active call against them now. */
-  limitsChanged(): void {
+  async limitsChanged(): Promise<void> {
     for (const id of [...this.quotaTimers.keys()]) {
       clearTimeout(this.quotaTimers.get(id));
       this.quotaTimers.delete(id);
     }
-    const c = this.open();
+    const c = await this.open();
     if (c?.state === "active") this.armQuota(c.call_id);
   }
 
   /** Whether a device may see this event; events of a targeted call only reach its phones. */
-  eventVisibleTo(event: Event, p: Principal): boolean {
+  async eventVisibleTo(event: Event, p: Principal): Promise<boolean> {
     if (p.kind === "agent" || !event.type.startsWith("call.")) return true;
-    const c = this.get((event as { call_id: string }).call_id);
+    const c = await this.get((event as { call_id: string }).call_id);
     return !c || canSee(c, p);
   }
 
-  create(p: Principal, body: Schemas["CreateCallRequest"]): CallRow {
+  async create(p: Principal, body: Schemas["CreateCallRequest"]): Promise<CallRow> {
     const direction: Direction = p.kind === "agent" ? "agent_to_user" : "user_to_agent";
     let targets: string[] | undefined;
     if (direction === "agent_to_user") {
       if (!body.reason) throw new ApiError(400, "invalid_request", "reason is required");
-      if (body.device_ids !== undefined) targets = this.validTargets(body.device_ids);
-      const n = this.ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
+      if (body.device_ids !== undefined) targets = await this.validTargets(body.device_ids);
+      const n = await this.ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
       if (n.n === 0) throw new ApiError(409, "no_devices", "No paired devices");
     } else if (body.device_ids !== undefined) {
       throw new ApiError(400, "invalid_request", "device_ids is only for calls placed by the agent");
     } else if (!this.ctx.hub.isAgentOnline()) {
       throw new ApiError(503, "agent_offline", "The agent is not connected");
     }
-    if (this.open()) throw new ApiError(409, "busy", "Another call is ringing or active");
-    checkCall(this.ctx.db, this.ctx.limits());
-    checkCallRate(this.ctx.db, this.ctx.limits());
+    if (await this.open()) throw new ApiError(409, "busy", "Another call is ringing or active");
+    await checkCall(this.ctx.db, this.ctx.limits());
+    await checkCallRate(this.ctx.db, this.ctx.limits());
 
     const now = Date.now();
     const row: CallRow = {
@@ -229,7 +230,7 @@ export class Calls {
       device_id: p.kind === "device" ? p.deviceId : null,
       device_ids: targets ? JSON.stringify(targets) : null,
     };
-    this.ctx.db
+    await this.ctx.db
       .prepare(
         `INSERT INTO calls (call_id, direction, state, reason, priority, agent_name, created_at, expires_at, device_id, device_ids)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -238,14 +239,14 @@ export class Calls {
     if (direction === "agent_to_user") {
       const devs =
         targets ??
-        (this.ctx.db.prepare("SELECT device_id FROM devices WHERE revoked_at IS NULL").all() as Array<{ device_id: string }>).map(
+        (await this.ctx.db.prepare("SELECT device_id FROM devices WHERE revoked_at IS NULL").all() as Array<{ device_id: string }>).map(
           (d) => d.device_id,
         );
       for (const d of devs) this.setPart(row.call_id, d, "ringing");
     } else if (p.kind === "device") {
       this.setPart(row.call_id, p.deviceId, "joined");
     }
-    this.ctx.events.emit({
+    await this.ctx.events.emit({
       type: "call.invite",
       call_id: row.call_id,
       direction,
@@ -260,12 +261,12 @@ export class Calls {
   }
 
   /** Targeted call: every id must be a paired, non-revoked phone. Duplicates are dropped. */
-  private validTargets(ids: string[]): string[] {
+  private async validTargets(ids: string[]): Promise<string[]> {
     const unique = [...new Set(ids)];
     if (unique.length === 0) throw new ApiError(400, "invalid_request", "device_ids must not be empty");
     const active = new Set(
       (
-        this.ctx.db
+        await this.ctx.db
           .prepare(`SELECT device_id FROM devices WHERE revoked_at IS NULL AND device_id IN (${unique.map(() => "?").join(",")})`)
           .all(...unique) as Array<{ device_id: string }>
       ).map((d) => d.device_id),
@@ -275,8 +276,8 @@ export class Calls {
     return unique;
   }
 
-  ringing(callId: string, deviceId: string): void {
-    const c = this.get(callId);
+  async ringing(callId: string, deviceId: string): Promise<void> {
+    const c = await this.get(callId);
     if (!c) throw notFound("Call");
     const stillRinging = c.state === "ringing" || (c.state === "active" && Date.now() <= c.expires_at);
     if (!stillRinging || c.direction !== "agent_to_user" || !canSee(c, { kind: "device", deviceId })) return;
@@ -284,7 +285,7 @@ export class Calls {
     if (!set) this.ringingDevices.set(callId, (set = new Set()));
     if (set.has(deviceId)) return;
     set.add(deviceId);
-    this.ctx.events.emit({ type: "call.ringing", call_id: callId, device_id: deviceId });
+    await this.ctx.events.emit({ type: "call.ringing", call_id: callId, device_id: deviceId });
   }
 
   /**
@@ -292,24 +293,24 @@ export class Calls {
    * `expires_at`), and a phone that already joined may rejoin (new token) while
    * the call is active. The first answer moves the call to `active`.
    */
-  accept(callId: string, p: Principal): CallRow {
-    const c = this.mustBeCallee(callId, p);
+  async accept(callId: string, p: Principal): Promise<CallRow> {
+    const c = await this.mustBeCallee(callId, p);
     const now = Date.now();
     if (p.kind === "device") {
-      const prev = this.part(callId, p.deviceId);
+      const prev = await this.part(callId, p.deviceId);
       if (c.state === "active" && prev === "joined") return this.rejoin(c, p.deviceId); // rejoin after a drop
       const ringing = c.state === "ringing" || (c.state === "active" && now <= c.expires_at);
       if (!ringing || (prev !== undefined && prev !== "ringing")) throw invalidState(c.state === "active" ? "active" : c.state);
       return this.joinDevice(c, p.deviceId);
     }
-    const res = this.ctx.db
+    const res = await this.ctx.db
       .prepare("UPDATE calls SET state = 'active', answered_at = ? WHERE call_id = ? AND state = 'ringing'")
       .run(now, callId);
-    if (res.changes !== 1) throw invalidState(this.get(callId)!.state);
+    if (res.changes !== 1) throw invalidState((await this.get(callId))!.state);
     this.settle(callId);
     this.armQuota(callId);
-    this.ctx.events.emit({ type: "call.accept", call_id: callId, by: "agent" });
-    return this.get(callId)!;
+    await this.ctx.events.emit({ type: "call.accept", call_id: callId, by: "agent" });
+    return (await this.get(callId))!;
   }
 
   /**
@@ -317,66 +318,66 @@ export class Calls {
    * while it is ringing or active, also after its ring window, after declining or
    * after hanging up. While the call rings this is the same as accepting.
    */
-  join(callId: string, deviceId: string): CallRow {
-    const c = this.get(callId);
+  async join(callId: string, deviceId: string): Promise<CallRow> {
+    const c = await this.get(callId);
     if (!c) throw notFound("Call");
     if (c.direction !== "agent_to_user") throw forbidden("Only calls from the agent can be joined");
     if (!canSee(c, { kind: "device", deviceId })) throw notForThisDevice();
     if (c.state !== "ringing" && c.state !== "active") throw new ApiError(409, "call_ended", `Call is ${c.state}`);
-    if (c.state === "active" && this.part(callId, deviceId) === "joined") return this.rejoin(c, deviceId);
+    if (c.state === "active" && (await this.part(callId, deviceId)) === "joined") return await this.rejoin(c, deviceId);
     return this.joinDevice(c, deviceId);
   }
 
   /** A phone already on the call asks for a new token: no event, but its join time moves on. */
-  private rejoin(c: CallRow, deviceId: string): CallRow {
+  private async rejoin(c: CallRow, deviceId: string): Promise<CallRow> {
     this.setPart(c.call_id, deviceId, "joined");
     return c;
   }
 
   /** A phone joins the room; the first one moves a ringing call to `active`. Emits `call.accept`. */
-  private joinDevice(c: CallRow, deviceId: string): CallRow {
+  private async joinDevice(c: CallRow, deviceId: string): Promise<CallRow> {
     if (c.state === "ringing") {
-      this.ctx.db
+      await this.ctx.db
         .prepare("UPDATE calls SET state = 'active', answered_at = ?, device_id = ? WHERE call_id = ? AND state = 'ringing'")
         .run(Date.now(), deviceId, c.call_id);
       this.armQuota(c.call_id);
     }
     this.setPart(c.call_id, deviceId, "joined");
     this.ringingDevices.get(c.call_id)?.delete(deviceId);
-    this.ctx.events.emit({ type: "call.accept", call_id: c.call_id, by: "user", device_id: deviceId });
-    return this.get(c.call_id)!;
+    await this.ctx.events.emit({ type: "call.accept", call_id: c.call_id, by: "user", device_id: deviceId });
+    return (await this.get(c.call_id))!;
   }
 
   /**
    * Decline. A phone declining only stops its own ringing; the call becomes
    * `declined` when no phone is left ringing or on the call.
    */
-  decline(callId: string, p: Principal): CallRow {
-    const c = this.mustBeCallee(callId, p);
+  async decline(callId: string, p: Principal): Promise<CallRow> {
+    const c = await this.mustBeCallee(callId, p);
     const by = p.kind === "agent" ? "agent" : "user";
     if (p.kind === "device") {
-      if (this.part(callId, p.deviceId) !== "ringing" || (c.state !== "ringing" && c.state !== "active")) {
+      if ((await this.part(callId, p.deviceId)) !== "ringing" || (c.state !== "ringing" && c.state !== "active")) {
         throw invalidState(c.state);
       }
-      this.setPart(callId, p.deviceId, "declined");
-      this.ctx.events.emit({ type: "call.decline", call_id: callId, by, device_id: p.deviceId });
-      if (c.state === "ringing" && this.countParts(callId, "ringing", "joined") === 0) {
-        this.ctx.db
+      await this.setPart(callId, p.deviceId, "declined");
+      await this.ctx.events.emit({ type: "call.decline", call_id: callId, by, device_id: p.deviceId });
+      if (c.state === "ringing" && (await this.countParts(callId, "ringing", "joined")) === 0) {
+        await this.ctx.db
           .prepare("UPDATE calls SET state = 'declined', ended_at = ?, ended_by = ? WHERE call_id = ? AND state = 'ringing'")
           .run(Date.now(), by, callId);
         this.settle(callId);
         this.closeRoom(callId);
       }
-      return this.get(callId)!;
+      return (await this.get(callId))!;
     }
-    const res = this.ctx.db
+    const res = await this.ctx.db
       .prepare("UPDATE calls SET state = 'declined', ended_at = ?, ended_by = ? WHERE call_id = ? AND state = 'ringing'")
       .run(Date.now(), by, callId);
-    if (res.changes !== 1) throw invalidState(this.get(callId)!.state);
+    if (res.changes !== 1) throw invalidState((await this.get(callId))!.state);
     this.settle(callId);
-    this.ctx.events.emit({ type: "call.decline", call_id: callId, by });
+    await this.ctx.events.emit({ type: "call.decline", call_id: callId, by });
     this.closeRoom(callId);
-    return this.get(callId)!;
+    return (await this.get(callId))!;
   }
 
   /**
@@ -384,25 +385,25 @@ export class Calls {
    * call a phone only leaves; the call ends with the agent or the last phone.
    * Idempotent on terminal states.
    */
-  end(callId: string, p: Principal): CallRow {
-    const c = this.get(callId);
+  async end(callId: string, p: Principal): Promise<CallRow> {
+    const c = await this.get(callId);
     if (!c || !canSee(c, p)) throw notFound("Call");
     const by = p.kind === "agent" ? "agent" : "user";
     // A call to the agent belongs to the phone that placed it.
     const foreignPhone = p.kind === "device" && c.direction === "user_to_agent" && c.device_id !== p.deviceId;
     if (c.state === "ringing") {
       if (p.kind !== callerKind(c.direction) || foreignPhone) throw forbidden("Decline a ringing call instead of ending it");
-      return this.finish(callId, "ringing", "canceled", by, "canceled") ?? this.get(callId)!;
+      return (await this.finish(callId, "ringing", "canceled", by, "canceled")) ?? (await this.get(callId))!;
     }
     if (c.state !== "active") return c;
     if (foreignPhone) throw forbidden("This device is not on the call");
     if (p.kind === "device" && c.direction === "agent_to_user") {
-      const prev = this.part(callId, p.deviceId);
+      const prev = await this.part(callId, p.deviceId);
       if (prev === "ringing") return this.decline(callId, p);
       if (prev !== "joined") throw forbidden("This device is not on the call");
       return this.leave(callId, p.deviceId, by, "hangup");
     }
-    return this.finish(callId, "active", "ended", by, "hangup") ?? this.get(callId)!;
+    return (await this.finish(callId, "active", "ended", by, "hangup")) ?? (await this.get(callId))!;
   }
 
   /**
@@ -411,16 +412,16 @@ export class Calls {
    * join is a stale one (e.g. kicked by its own rejoin with the same identity) and
    * must not take the phone off the call.
    */
-  deviceLeft(callId: string, deviceId: string, sessionJoinedAt?: number): void {
-    const p = this.partRow(callId, deviceId);
+  async deviceLeft(callId: string, deviceId: string, sessionJoinedAt?: number): Promise<void> {
+    const p = await this.partRow(callId, deviceId);
     if (p?.state !== "joined") return;
     if (sessionJoinedAt !== undefined && sessionJoinedAt < p.updated_at - JOIN_CLOCK_SLACK_MS) return;
-    this.leave(callId, deviceId, "relay", "room_closed");
+    await this.leave(callId, deviceId, "relay", "room_closed");
   }
 
   /** The room went away, or the agent left it (LiveKit webhook). */
-  roomClosed(callId: string): void {
-    this.finish(callId, "active", "ended", "relay", "room_closed");
+  async roomClosed(callId: string): Promise<void> {
+    await this.finish(callId, "active", "ended", "relay", "room_closed");
   }
 
   /**
@@ -428,55 +429,55 @@ export class Calls {
    * refreshing, and only closing the room takes that away, so the call ends. One that
    * is only ringing has no token: it just stops counting.
    */
-  deviceRevoked(deviceId: string): void {
-    const c = this.open();
+  async deviceRevoked(deviceId: string): Promise<void> {
+    const c = await this.open();
     if (!c) return;
-    const part = this.part(c.call_id, deviceId);
+    const part = await this.part(c.call_id, deviceId);
     if (part === "joined") {
-      if (c.state === "ringing") this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
-      else this.finish(c.call_id, "active", "ended", "relay", "room_closed");
+      if (c.state === "ringing") void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+      else void this.finish(c.call_id, "active", "ended", "relay", "room_closed");
     } else if (part === "ringing") {
-      this.setPart(c.call_id, deviceId, "missed");
-      if (c.state === "ringing" && this.countParts(c.call_id, "ringing", "joined") === 0) {
-        this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+      await this.setPart(c.call_id, deviceId, "missed");
+      if (c.state === "ringing" && (await this.countParts(c.call_id, "ringing", "joined")) === 0) {
+        void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
       }
     }
   }
 
   /** Ends whatever call is open, e.g. when the tenant is disabled or deleted. */
-  terminateOpen(): void {
-    const c = this.open();
-    if (c?.state === "ringing") this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
-    else if (c?.state === "active") this.finish(c.call_id, "active", "ended", "relay", "room_closed");
+  async terminateOpen(): Promise<void> {
+    const c = await this.open();
+    if (c?.state === "ringing") void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+    else if (c?.state === "active") void this.finish(c.call_id, "active", "ended", "relay", "room_closed");
   }
 
-  private leave(callId: string, deviceId: string, by: Schemas["Actor"], reason: Schemas["EndReason"]): CallRow {
-    this.setPart(callId, deviceId, "left");
-    const c = this.get(callId)!;
+  private async leave(callId: string, deviceId: string, by: Schemas["Actor"], reason: Schemas["EndReason"]): Promise<CallRow> {
+    await this.setPart(callId, deviceId, "left");
+    const c = (await this.get(callId))!;
     // Others may still answer until the ring window closes; then the timer ends an empty call.
-    if (this.countParts(callId, "joined") === 0 && (Date.now() > c.expires_at || this.countParts(callId, "ringing") === 0)) {
-      return this.finish(callId, "active", "ended", by, reason) ?? this.get(callId)!;
+    if ((await this.countParts(callId, "joined")) === 0 && (Date.now() > c.expires_at || (await this.countParts(callId, "ringing")) === 0)) {
+      return (await this.finish(callId, "active", "ended", by, reason)) ?? (await this.get(callId))!;
     }
     return c;
   }
 
-  private finish(
+  private async finish(
     callId: string,
     from: "ringing" | "active",
     to: CallState,
     by: Schemas["Actor"],
     reason: Schemas["EndReason"],
-  ): CallRow | undefined {
+  ): Promise<CallRow | undefined> {
     const now = Date.now();
-    const res = this.ctx.db
+    const res = await this.ctx.db
       .prepare("UPDATE calls SET state = ?, ended_at = ?, ended_by = ?, end_reason = ? WHERE call_id = ? AND state = ?")
       .run(to, now, by, reason, callId, from);
     if (res.changes !== 1) return undefined;
     this.settle(callId);
     clearTimeout(this.quotaTimers.get(callId));
     this.quotaTimers.delete(callId);
-    const row = this.get(callId)!;
-    this.ctx.events.emit({
+    const row = (await this.get(callId))!;
+    await this.ctx.events.emit({
       type: "call.end",
       call_id: callId,
       by,
@@ -487,15 +488,15 @@ export class Calls {
     return row;
   }
 
-  private mustBeCallee(callId: string, p: Principal): CallRow {
-    const c = this.get(callId);
+  private async mustBeCallee(callId: string, p: Principal): Promise<CallRow> {
+    const c = await this.get(callId);
     if (!c) throw notFound("Call");
     if (p.kind === callerKind(c.direction)) throw forbidden("The caller cannot answer its own call");
     if (!canSee(c, p)) throw notForThisDevice();
     return c;
   }
 
-  private armTimer(c: CallRow, delayMs = Math.max(0, c.expires_at - Date.now())): void {
+  private async armTimer(c: CallRow, delayMs = Math.max(0, c.expires_at - Date.now())): Promise<void> {
     const t = setTimeout(() => {
       try {
         this.timeout(c.call_id);
@@ -509,37 +510,37 @@ export class Calls {
     this.timers.set(c.call_id, t);
   }
 
-  private timeout(callId: string): void {
+  private async timeout(callId: string): Promise<void> {
     this.timers.delete(callId);
     this.ringingDevices.delete(callId);
     // Phones that never answered stop ringing (they time out locally too).
-    this.ctx.db
+    await this.ctx.db
       .prepare("UPDATE call_participants SET state = 'missed', updated_at = ? WHERE call_id = ? AND state = 'ringing'")
       .run(Date.now(), callId);
-    const c = this.get(callId);
+    const c = await this.get(callId);
     if (c?.state === "active") {
       // Everyone who answered already left while others could still join.
-      if (c.direction === "agent_to_user" && this.countParts(callId, "joined") === 0) {
+      if (c.direction === "agent_to_user" && (await this.countParts(callId, "joined")) === 0) {
         this.finish(callId, "active", "ended", "relay", "hangup");
       }
       return;
     }
-    const res = this.ctx.db
+    const res = await this.ctx.db
       .prepare("UPDATE calls SET state = 'missed', ended_at = ?, ended_by = 'relay' WHERE call_id = ? AND state = 'ringing'")
       .run(Date.now(), callId);
     if (res.changes !== 1) return;
-    this.ctx.events.emit({ type: "call.missed", call_id: callId });
+    await this.ctx.events.emit({ type: "call.missed", call_id: callId });
     this.closeRoom(callId);
   }
 
   /** The call left `ringing`: stop the timer. */
-  private settle(callId: string): void {
+  private async settle(callId: string): Promise<void> {
     clearTimeout(this.timers.get(callId));
     this.timers.delete(callId);
     this.ringingDevices.delete(callId);
   }
 
-  private closeRoom(callId: string): void {
+  private async closeRoom(callId: string): Promise<void> {
     const lk = this.ctx.livekit;
     if (!lk) return;
     lk.deleteRoom(roomName(this.ctx, callId)).catch(() => undefined);
@@ -590,7 +591,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
     async (req, reply) => {
       const p = principal(req);
       const lk = livekit();
-      const row = calls.create(p, req.body ?? {});
+      const row = await calls.create(p, req.body ?? {});
       // The push is already on its way; create the room and the caller's token meanwhile.
       const [, join] = await Promise.all([
         lk
@@ -634,7 +635,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
   );
 
   app.get<{ Params: { call_id: string } }>("/v1/calls/:call_id", { preHandler: auth, schema: { params: CALL_ID } }, async (req) => {
-    const c = calls.get(req.params.call_id);
+    const c = await calls.get(req.params.call_id);
     if (!c || !canSee(c, principal(req))) throw notFound("Call");
     return callFromRow(c);
   });
@@ -645,7 +646,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
     async (req, reply) => {
       const p = principal(req);
       if (p.kind !== "device") throw new Error("unreachable");
-      calls.ringing(req.params.call_id, p.deviceId);
+      await calls.ringing(req.params.call_id, p.deviceId);
       return reply.code(204).send();
     },
   );
@@ -656,7 +657,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
     async (req) => {
       const p = principal(req);
       livekit();
-      const row = calls.accept(req.params.call_id, p);
+      const row = await calls.accept(req.params.call_id, p);
       return { call: callFromRow(row), join: await joinFor(row.call_id, p) };
     },
   );
@@ -668,7 +669,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
       const p = principal(req);
       if (p.kind !== "device") throw new Error("unreachable");
       livekit();
-      const row = calls.join(req.params.call_id, p.deviceId);
+      const row = await calls.join(req.params.call_id, p.deviceId);
       return { call: callFromRow(row), join: await joinFor(row.call_id, p) };
     },
   );
@@ -676,13 +677,13 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
   app.post<{ Params: { call_id: string } }>(
     "/v1/calls/:call_id/decline",
     { preHandler: auth, schema: { params: CALL_ID } },
-    async (req) => callFromRow(calls.decline(req.params.call_id, principal(req))),
+    async (req) => callFromRow(await calls.decline(req.params.call_id, principal(req))),
   );
 
   app.post<{ Params: { call_id: string } }>(
     "/v1/calls/:call_id/end",
     { preHandler: auth, schema: { params: CALL_ID } },
-    async (req) => callFromRow(calls.end(req.params.call_id, principal(req))),
+    async (req) => callFromRow(await calls.end(req.params.call_id, principal(req))),
   );
 
   // LiveKit webhooks: the room closing (or the callee dropping out) ends an active call.
@@ -700,17 +701,17 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
         throw new ApiError(401, "unauthorized", "Bad webhook signature");
       }
       const room = event.room?.name;
-      const c = room?.startsWith(ctx.roomPrefix) ? calls.get(room.slice(ctx.roomPrefix.length)) : undefined;
+      const c = room?.startsWith(ctx.roomPrefix) ? await calls.get(room.slice(ctx.roomPrefix.length)) : undefined;
       if (c?.state === "active") {
         const identity = event.participant?.identity ?? "";
         const left = event.event === "participant_left";
         if (event.event === "room_finished" || (left && identity === "agent")) {
           req.log.info({ call: c.call_id, event: event.event, identity }, "call ended by LiveKit");
-          calls.roomClosed(c.call_id);
+          await calls.roomClosed(c.call_id);
         } else if (left && identity.startsWith("device_")) {
           const deviceId = identity.slice("device_".length);
-          if (c.direction === "agent_to_user") calls.deviceLeft(c.call_id, deviceId, sessionJoinedAt(event.participant));
-          else if (deviceId === c.device_id) calls.roomClosed(c.call_id);
+          if (c.direction === "agent_to_user") await calls.deviceLeft(c.call_id, deviceId, sessionJoinedAt(event.participant));
+          else if (deviceId === c.device_id) await calls.roomClosed(c.call_id);
         }
       }
       return reply.code(200).send({ ok: true });

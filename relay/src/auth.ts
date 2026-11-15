@@ -65,11 +65,11 @@ export class Auth {
       throw unauthorized();
     }
 
-    const row = this.db.prepare("SELECT revoked_at FROM devices WHERE device_id = ?").get(deviceId) as
+    const row = await this.db.prepare("SELECT revoked_at FROM devices WHERE device_id = ?").get(deviceId) as
       | { revoked_at: number | null }
       | undefined;
     if (!row || row.revoked_at !== null) throw unauthorized("Device revoked or unknown");
-    this.db.prepare("UPDATE devices SET last_seen_at = ? WHERE device_id = ?").run(Date.now(), deviceId);
+    await this.db.prepare("UPDATE devices SET last_seen_at = ? WHERE device_id = ?").run(Date.now(), deviceId);
     return { kind: "device", deviceId };
   }
 }

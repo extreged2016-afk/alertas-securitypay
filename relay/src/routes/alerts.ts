@@ -41,8 +41,8 @@ export function alertFromRow(r: AlertRow): Alert {
   };
 }
 
-function getRow(ctx: Ctx, alertId: string): AlertRow {
-  const row = ctx.db.prepare("SELECT * FROM alerts WHERE alert_id = ?").get(alertId) as AlertRow | undefined;
+async function getRow(ctx: Ctx, alertId: string): Promise<AlertRow> {
+  const row = await ctx.db.prepare("SELECT * FROM alerts WHERE alert_id = ?").get(alertId) as AlertRow | undefined;
   if (!row) throw notFound("Alert");
   return row;
 }
@@ -54,7 +54,7 @@ function voiceUrl(ctx: Ctx): string | undefined {
   return ctx.cfg.livekit?.publicUrl;
 }
 
-function emitNew(ctx: Ctx, row: AlertRow): void {
+async function emitNew(ctx: Ctx, row: AlertRow): Promise<void> {
   const draft = {
     type: "alert.new",
     alert_id: row.alert_id,
@@ -68,7 +68,7 @@ function emitNew(ctx: Ctx, row: AlertRow): void {
     ...(row.voice_room ? { voice_room: row.voice_room } : {}),
     ...(row.voice_room && voiceUrl(ctx) ? { voice_url: voiceUrl(ctx)! } : {}),
   } as EventDraft;
-  ctx.events.emit(draft);
+  await ctx.events.emit(draft);
 }
 
 /** Creates the LiveKit room when voice is enabled and this alert is critical. */
@@ -120,7 +120,7 @@ export function alertRoutes(app: FastifyInstance, ctx: Ctx): void {
       const source = b.source?.trim() || (p.kind === "agent" ? ctx.cfg.agentName : "securitypay-app");
       const room = await prepareVoice(ctx, alertId, priority, b.voice !== false);
       const tts = (b.tts_text?.trim() || `${b.title}. ${b.message}`).slice(0, 1200);
-      ctx.db
+      await ctx.db
         .prepare(
           `INSERT INTO alerts (alert_id, type, title, message, priority, source, data, voice_room, tts_text, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -137,8 +137,8 @@ export function alertRoutes(app: FastifyInstance, ctx: Ctx): void {
           tts,
           now,
         );
-      const row = getRow(ctx, alertId);
-      emitNew(ctx, row);
+      const row = await getRow(ctx, alertId);
+      await emitNew(ctx, row);
       req.log.info({ alert: alertId, priority, source }, "alert created");
       return reply.code(201).send(alertFromRow(row));
     },
@@ -161,33 +161,33 @@ export function alertRoutes(app: FastifyInstance, ctx: Ctx): void {
     async (req) => {
       const limit = req.query.limit ?? 100;
       const rows = req.query.priority
-        ? (ctx.db
+        ? (await ctx.db
             .prepare("SELECT * FROM alerts WHERE priority = ? ORDER BY created_at DESC LIMIT ?")
             .all(req.query.priority, limit) as unknown as AlertRow[])
-        : (ctx.db.prepare("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as AlertRow[]);
+        : (await ctx.db.prepare("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as AlertRow[]);
       return { alerts: rows.map(alertFromRow) };
     },
   );
 
   app.get<{ Params: { alert_id: string } }>("/v1/alerts/:alert_id", { preHandler: auth }, async (req) =>
-    alertFromRow(getRow(ctx, req.params.alert_id)),
+    alertFromRow(await getRow(ctx, req.params.alert_id)),
   );
 
   app.post<{ Params: { alert_id: string } }>("/v1/alerts/:alert_id/ack", { preHandler: auth }, async (req) => {
     const p = principal(req);
-    const row = getRow(ctx, req.params.alert_id);
+    const row = await getRow(ctx, req.params.alert_id);
     const now = Date.now();
     const by: "agent" | "user" = p.kind === "agent" ? "agent" : "user";
     if (!row.acked_at) {
-      ctx.db.prepare("UPDATE alerts SET acked_at = ?, acked_by = ? WHERE alert_id = ?").run(now, by, row.alert_id);
-      ctx.events.emit({
+      await ctx.db.prepare("UPDATE alerts SET acked_at = ?, acked_by = ? WHERE alert_id = ?").run(now, by, row.alert_id);
+      await ctx.events.emit({
         type: "alert.ack",
         alert_id: row.alert_id,
         acked_at: now,
         acked_by: by,
       } as EventDraft);
     }
-    return alertFromRow(getRow(ctx, row.alert_id));
+    return alertFromRow(await getRow(ctx, row.alert_id));
   });
 
   app.post<{ Params: { alert_id: string } }>(
@@ -195,7 +195,7 @@ export function alertRoutes(app: FastifyInstance, ctx: Ctx): void {
     { preHandler: auth },
     async (req) => {
       const p = principal(req);
-      const row = getRow(ctx, req.params.alert_id);
+      const row = await getRow(ctx, req.params.alert_id);
       if (!ctx.livekit) throw new ApiError(409, "invalid_state", "LiveKit is not configured on this relay");
       const room = row.voice_room ?? alertRoomName(row.alert_id);
       try {
@@ -204,7 +204,7 @@ export function alertRoutes(app: FastifyInstance, ctx: Ctx): void {
         // Already exists is the normal case.
       }
       if (!row.voice_room) {
-        ctx.db.prepare("UPDATE alerts SET voice_room = ? WHERE alert_id = ?").run(room, row.alert_id);
+        await ctx.db.prepare("UPDATE alerts SET voice_room = ? WHERE alert_id = ?").run(room, row.alert_id);
       }
       const canPublish = p.kind === "agent";
       const identity = p.kind === "agent" ? "voice-agent" : `device_${p.deviceId}`;

@@ -92,18 +92,18 @@ describe("event log", () => {
   it("a failed event write leaves no row behind", async () => {
     const b = await app();
     b.ctx.db.exec("CREATE TRIGGER no_body BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END");
-    const before = b.ctx.events.lastSeq();
-    expect(() => b.ctx.events.emit({ type: "msg.read", msg_id: "m", by: "user" })).toThrow();
-    expect(b.ctx.events.lastSeq()).toBe(before);
+    const before = await b.ctx.events.lastSeq();
+    await expect(b.ctx.events.emit({ type: "msg.read", msg_id: "m", by: "user" })).rejects.toThrow();
+    expect(await b.ctx.events.lastSeq()).toBe(before);
   });
 
   it("a bad stored row doesn't block the cursor", async () => {
     const b = await app();
     b.ctx.db.prepare("INSERT INTO events (id, type, ts, body) VALUES ('evt_x', 'msg.new', 1, '')").run();
     await post(b, "/v1/messages", AGENT, { text: "after" });
-    const page = b.ctx.events.list(0, 500);
+    const page = await b.ctx.events.list(0, 500);
     expect(page.events.map((e) => e.type)).toEqual(["msg.new"]);
-    expect(page.nextAfterSeq).toBe(b.ctx.events.lastSeq());
+    expect(page.nextAfterSeq).toBe(await b.ctx.events.lastSeq());
     expect((await b.app.inject({ url: "/v1/events?after_seq=0", headers: AGENT })).statusCode).toBe(200);
   });
 
@@ -112,7 +112,7 @@ describe("event log", () => {
     const payload = JSON.stringify({ text: "bad \ud800 ok 😀", reply_to: "msg_\ud83d" });
     const r = await b.app.inject({ method: "POST", url: "/v1/messages", headers: { ...AGENT, "content-type": "application/json" }, payload });
     expect(r.statusCode).toBe(201);
-    const [e] = b.ctx.events.list(0, 500).events as Array<{ text: string; reply_to: string }>;
+    const [e] = (await b.ctx.events.list(0, 500)).events as Array<{ text: string; reply_to: string }>;
     expect(e!.text).toBe("bad � ok 😀");
     expect(e!.reply_to).toBe("msg_�");
   });
@@ -166,9 +166,9 @@ describe("websocket", () => {
   it("replays a long history in order, once, with live events after it", async () => {
     const b = await app();
     const dev = await pairDevice(b);
-    for (let i = 0; i < 450; i++) b.ctx.events.emit({ type: "msg.read", msg_id: `m${i}`, by: "agent" });
+    for (let i = 0; i < 450; i++) await b.ctx.events.emit({ type: "msg.read", msg_id: `m${i}`, by: "agent" });
     const url = await listen(b);
-    const last = b.ctx.events.lastSeq();
+    const last = await b.ctx.events.lastSeq();
 
     const got = collect(url, dev.device_jwt, (s) => s.some((e) => e.type === "msg.new"));
     await new Promise((r) => setTimeout(r, 1));

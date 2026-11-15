@@ -24,6 +24,10 @@ services:
     envVars:
       - key: SECURITYPAY_DATA_DIR
         value: /data
+      # Supabase (PostgreSQL). Si se define, el Relay usa Postgres en lugar de SQLite
+      # y los dispositivos emparejados persisten aunque Render reinicie el servicio.
+      - key: DATABASE_URL
+        sync: false
       - key: SECURITYPAY_AGENT_NAME
         value: Alert SecurityPay
       # La URL pública sale de RENDER_EXTERNAL_URL. Si usas un dominio propio,

@@ -11,7 +11,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY securitypay_voice.py ./
 
-RUN useradd --system --uid 10001 voice
+RUN useradd --system --uid 10001 voice || true
 USER voice
 
 ENV PYTHONUNBUFFERED=1

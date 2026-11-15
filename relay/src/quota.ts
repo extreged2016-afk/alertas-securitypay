@@ -37,9 +37,9 @@ export function dayStart(now = Date.now()): number {
  * an active call counts up to now and a call that started last month counts only its
  * part in this month.
  */
-export function callMsThisMonth(db: Db, now = Date.now()): number {
+export async function callMsThisMonth(db: Db, now = Date.now()): Promise<number> {
   const start = monthStart(now);
-  const r = db
+  const r = await db
     .prepare(
       `SELECT COALESCE(SUM(MAX(0, MIN(COALESCE(ended_at, ?), ?) - MAX(answered_at, ?))), 0) AS ms
        FROM calls WHERE answered_at IS NOT NULL AND COALESCE(ended_at, ?) > ?`,
@@ -48,41 +48,41 @@ export function callMsThisMonth(db: Db, now = Date.now()): number {
   return Number(r.ms);
 }
 
-function count(db: Db, sql: string, ...args: number[]): number {
-  return Number((db.prepare(sql).get(...args) as { n: number }).n);
+async function count(db: Db, sql: string, ...args: number[]): Promise<number> {
+  return Number((await db.prepare(sql).get(...args) as { n: number }).n);
 }
 
-const activeDevices = (db: Db) => count(db, "SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL");
-const messagesToday = (db: Db, now: number) =>
+const activeDevices = async (db: Db) => count(db, "SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL");
+const messagesToday = async (db: Db, now: number) =>
   count(db, "SELECT COUNT(*) AS n FROM messages WHERE created_at >= ?", dayStart(now));
 
-export function usage(db: Db, now = Date.now()): Usage {
+export async function usage(db: Db, now = Date.now()): Promise<Usage> {
   const d = new Date(now);
   return {
     month: `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`,
-    call_seconds: Math.floor(callMsThisMonth(db, now) / 1000),
-    calls: count(db, "SELECT COUNT(*) AS n FROM calls WHERE created_at >= ?", monthStart(now)),
-    messages_today: messagesToday(db, now),
-    devices: activeDevices(db),
+    call_seconds: Math.floor((await callMsThisMonth(db, now)) / 1000),
+    calls: await count(db, "SELECT COUNT(*) AS n FROM calls WHERE created_at >= ?", monthStart(now)),
+    messages_today: await messagesToday(db, now),
+    devices: await activeDevices(db),
   };
 }
 
-export function checkPair(db: Db, limits: Limits): void {
-  if (limits.max_devices !== null && activeDevices(db) >= limits.max_devices) {
+export async function checkPair(db: Db, limits: Limits): Promise<void> {
+  if (limits.max_devices !== null && (await activeDevices(db)) >= limits.max_devices) {
     throw quotaExceeded(`Your plan allows ${limits.max_devices} paired phone(s); unpair one first`);
   }
 }
 
-export function checkMessage(db: Db, limits: Limits): void {
-  if (limits.messages_per_day !== null && messagesToday(db, Date.now()) >= limits.messages_per_day) {
+export async function checkMessage(db: Db, limits: Limits): Promise<void> {
+  if (limits.messages_per_day !== null && (await messagesToday(db, Date.now())) >= limits.messages_per_day) {
     throw quotaExceeded(`Your plan allows ${limits.messages_per_day} messages per day`);
   }
 }
 
 /** Call time left this month in ms, or undefined when unlimited. */
-export function callMsLeft(db: Db, limits: Limits): number | undefined {
+export async function callMsLeft(db: Db, limits: Limits): Promise<number | undefined> {
   if (limits.call_seconds_per_month === null) return undefined;
-  return Math.max(0, limits.call_seconds_per_month * 1000 - callMsThisMonth(db));
+  return Math.max(0, limits.call_seconds_per_month * 1000 - (await callMsThisMonth(db)));
 }
 
 /**
@@ -92,14 +92,14 @@ export function callMsLeft(db: Db, limits: Limits): number | undefined {
  */
 export const UNANSWERED_CALLS_PER_HOUR = 20;
 
-export function checkCallRate(db: Db, limits: Limits, now = Date.now()): void {
+export async function checkCallRate(db: Db, limits: Limits, now = Date.now()): Promise<void> {
   if (limits.call_seconds_per_month === null) return;
-  const n = count(db, "SELECT COUNT(*) AS n FROM calls WHERE created_at >= ? AND answered_at IS NULL", now - 3_600_000);
+  const n = await count(db, "SELECT COUNT(*) AS n FROM calls WHERE created_at >= ? AND answered_at IS NULL", now - 3_600_000);
   if (n >= UNANSWERED_CALLS_PER_HOUR) throw new ApiError(429, "rate_limited", "Too many unanswered calls; try again later");
 }
 
-export function checkCall(db: Db, limits: Limits): void {
-  const left = callMsLeft(db, limits);
+export async function checkCall(db: Db, limits: Limits): Promise<void> {
+  const left = await callMsLeft(db, limits);
   if (left !== undefined && left < 1000) {
     throw quotaExceeded(`Your plan's ${Math.round(limits.call_seconds_per_month! / 60)} call minutes for this month are used up`);
   }

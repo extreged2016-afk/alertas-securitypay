@@ -132,7 +132,7 @@ export class Hub {
   }
 
   private async load(tenantId: string): Promise<Tenant | undefined> {
-    const record = this.registry.get(tenantId);
+    const record = await this.registry.get(tenantId);
     if (!record) return undefined;
     const cfg: Config = {
       ...this.cfg,
@@ -183,14 +183,14 @@ export class Hub {
 
   /** After a restart, load the tenants with a ringing or active call so their timers run. */
   async resumeOpenCalls(): Promise<void> {
-    for (const id of this.registry.ids()) {
+    for (const id of await this.registry.ids()) {
       const file = join(this.tenantDir(id), "relay.db");
       if (!existsSync(file)) continue;
       let open = false;
       try {
         const db = new DatabaseSync(file);
         try {
-          open = db.prepare("SELECT 1 FROM calls WHERE state IN ('ringing','active') LIMIT 1").get() !== undefined;
+          open = await db.prepare("SELECT 1 FROM calls WHERE state IN ('ringing','active') LIMIT 1").get() !== undefined;
         } finally {
           db.close();
         }
@@ -202,7 +202,7 @@ export class Hub {
     }
   }
 
-  view(t: Tenant) {
+  async view(t: Tenant) {
     return {
       tenant_id: t.record.tenant_id,
       base_url: this.baseUrl(t.record.tenant_id),
@@ -210,21 +210,21 @@ export class Hub {
       limits: t.record.limits,
       disabled: t.record.disabled,
       created_at: t.record.created_at,
-      usage: usage(t.built.ctx.db),
+      usage: await usage(t.built.ctx.db),
     };
   }
 
-  async create(agentName: string, limits: Limits): Promise<{ tenant: ReturnType<Hub["view"]>; api_key: string }> {
+  async create(agentName: string, limits: Limits): Promise<{ tenant: Awaited<ReturnType<Hub["view"]>>; api_key: string }> {
     const id = newId("tnt");
-    const { apiKey } = this.registry.create(id, agentName, limits);
+    const { apiKey } = await this.registry.create(id, agentName, limits);
     const t = (await this.tenant(id))!;
-    return { tenant: this.view(t), api_key: apiKey };
+    return { tenant: await this.view(t), api_key: apiKey };
   }
 
   async update(t: Tenant, patch: { agent_name?: string; limits?: Partial<Limits>; disabled?: boolean }): Promise<void> {
     const limits = patch.limits ? { ...t.record.limits, ...patch.limits } : undefined;
-    this.registry.update(t.record.tenant_id, { agent_name: patch.agent_name, limits, disabled: patch.disabled });
-    t.record = this.registry.get(t.record.tenant_id)!;
+    await this.registry.update(t.record.tenant_id, { agent_name: patch.agent_name, limits, disabled: patch.disabled });
+    t.record = (await this.registry.get(t.record.tenant_id))!;
     if (limits) t.built.ctx.calls?.limitsChanged();
     if (patch.agent_name !== undefined) t.built.ctx.cfg.agentName = patch.agent_name;
     // Turned off: end its call and drop every socket now; reconnects get 403 tenant_disabled.
@@ -267,12 +267,12 @@ export class Hub {
     for (const [h, e] of this.agentTokens) if (e.expiresAt <= now) this.agentTokens.delete(h);
   }
 
-  rotateKey(t: Tenant): string {
-    const apiKey = this.registry.rotateKey(t.record.tenant_id);
-    t.record = this.registry.get(t.record.tenant_id)!;
+  async rotateKey(t: Tenant): Promise<string> {
+    const apiKey = await this.registry.rotateKey(t.record.tenant_id);
+    t.record = (await this.registry.get(t.record.tenant_id))!;
     this.revokeAgentTokens(t.record.tenant_id);
     // A pairing token minted with the old key must not outlive it.
-    t.built.ctx.db.prepare("DELETE FROM pairing_tokens WHERE used_at IS NULL").run();
+    await t.built.ctx.db.prepare("DELETE FROM pairing_tokens WHERE used_at IS NULL").run();
     t.built.ctx.hub.disconnectAgent();
     return apiKey;
   }
@@ -281,7 +281,7 @@ export class Hub {
     const t = await this.loaded.get(tenantId)?.catch(() => undefined);
     t?.built.ctx.calls?.terminateOpen();
     // Registry first: from here on no request can (re)load the tenant while it closes.
-    this.registry.delete(tenantId);
+    await this.registry.delete(tenantId);
     this.revokeAgentTokens(tenantId);
     await this.unload(tenantId);
     if (this.cfg.dataDir !== ":memory:") rmSync(this.tenantDir(tenantId), { recursive: true, force: true });
@@ -292,7 +292,7 @@ export class Hub {
   private async route(url: string | undefined): Promise<{ t: Tenant; rest: string } | { status: number; code: string; message: string } | null> {
     const m = url?.match(TENANT_PATH);
     if (!m) return null;
-    const record = this.registry.get(m[1]!);
+    const record = await this.registry.get(m[1]!);
     if (!record) return { status: 404, code: "not_found", message: "Tenant not found" };
     if (record.disabled) return { status: 403, code: "tenant_disabled", message: "This account is disabled" };
     const t = await this.tenant(m[1]!);
@@ -416,7 +416,7 @@ export async function buildHub(cfg: Config, opts: HubOptions): Promise<{ app: Fa
     );
 
     scope.get<{ Params: { tid: string } }>("/admin/v1/tenants/:tid", { schema: { params: TID_PARAMS } }, async (req) =>
-      hub.view(await mustTenant(req.params.tid)),
+      await hub.view(await mustTenant(req.params.tid)),
     );
 
     scope.patch<{ Params: { tid: string }; Body: { agent_name?: string; limits?: Partial<Limits>; disabled?: boolean } }>(
@@ -434,14 +434,14 @@ export async function buildHub(cfg: Config, opts: HubOptions): Promise<{ app: Fa
       async (req) => {
         const t = await mustTenant(req.params.tid);
         await hub.update(t, req.body);
-        return hub.view(t);
+        return await hub.view(t);
       },
     );
 
     scope.post<{ Params: { tid: string } }>("/admin/v1/tenants/:tid/api-key", { schema: { params: TID_PARAMS } }, async (req) => {
       const t = await mustTenant(req.params.tid);
       req.log.info({ tenant: t.record.tenant_id }, "tenant API key rotated");
-      return { api_key: hub.rotateKey(t) };
+      return { api_key: await hub.rotateKey(t) };
     });
 
     scope.delete<{ Params: { tid: string } }>("/admin/v1/tenants/:tid", { schema: { params: TID_PARAMS } }, async (req, reply) => {
@@ -515,7 +515,7 @@ export async function buildHub(cfg: Config, opts: HubOptions): Promise<{ app: Fa
       async (req) => {
         const key = req.body.api_key;
         // An agent token (`at_…`) resolves like the tenant's API key while it is valid.
-        const r = key.startsWith("at_") ? hub.registry.get(hub.agentTokenTenant(key) ?? "") : hub.registry.byApiKey(key);
+        const r = key.startsWith("at_") ? await hub.registry.get(hub.agentTokenTenant(key) ?? "") : await hub.registry.byApiKey(key);
         if (!r) throw notFound("API key");
         if (r.disabled) throw new ApiError(403, "tenant_disabled", "This account is disabled");
         return { tenant_id: r.tenant_id, base_url: hub.baseUrl(r.tenant_id) };

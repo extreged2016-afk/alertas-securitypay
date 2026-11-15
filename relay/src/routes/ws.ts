@@ -57,13 +57,13 @@ export class WsHub {
     const previous = this.agent;
     this.agent = ws;
     if (previous) previous.close(CLOSE_REPLACED, "replaced by a newer agent connection");
-    else this.events.emit({ type: "agent.presence", online: true }, "devices");
+    else void this.events.emit({ type: "agent.presence", online: true }, "devices");
   }
 
   detachAgent(ws: WebSocket): void {
     if (this.agent !== ws) return;
     this.agent = undefined;
-    this.events.emit({ type: "agent.presence", online: false }, "devices");
+    void this.events.emit({ type: "agent.presence", online: false }, "devices");
   }
 
   attachDevice(deviceId: string, ws: WebSocket): void {
@@ -193,7 +193,7 @@ export function wsRoutes(app: FastifyInstance, ctx: Ctx): void {
         );
         let after = (req.query as { after_seq?: number } | undefined)?.after_seq ?? 0;
         for (;;) {
-          const page = events.list(after, REPLAY_PAGE, p);
+          const page = await events.list(after, REPLAY_PAGE, p);
           page.events.forEach(send);
           after = page.nextAfterSeq;
           if (!page.hasMore) break;

@@ -22,7 +22,7 @@ if (process.env.SECURITYPAY_HUB === "1") {
   const { app, hub } = await buildHub(cfg, { adminToken });
   shutdownOn(() => app.close(), app.log);
   await app.listen({ host: cfg.host, port: cfg.port });
-  app.log.info({ public_url: cfg.publicUrl, tenants: hub.registry.ids().length }, "securitypay relay ready (hub mode)");
+  app.log.info({ public_url: cfg.publicUrl, tenants: (await hub.registry.ids()).length }, "securitypay relay ready (hub mode)");
 } else {
   const { app, ctx, apiKey, apiKeyGenerated } = await buildApp(cfg);
 

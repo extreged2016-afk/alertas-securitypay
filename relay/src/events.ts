@@ -12,7 +12,7 @@ export interface Subscriber {
 
 type Listener = (event: Event) => void;
 /** Decides whether a principal may see an event (e.g. a targeted call's events). */
-export type Visibility = (event: Event, principal: Principal) => boolean;
+export type Visibility = (event: Event, principal: Principal) => boolean | Promise<boolean>;
 
 /** A stored event, or nothing for a row that can't be read (older relays could leave empty ones). */
 function parseEvent(body: string): Event[] {
@@ -35,27 +35,31 @@ export class EventLog {
 
   constructor(private readonly db: Db) {}
 
-  emit(draft: EventDraft, audience: Audience = "all"): Event {
+  async emit(draft: EventDraft, audience: Audience = "all"): Promise<Event> {
     const event = { ...draft, id: newId("evt"), ts: Date.now() } as Event;
     if (!EPHEMERAL_TYPES.has(event.type)) {
       // The body holds the seq, so it takes two statements; they commit or fail together:
       // an empty row left behind would be replayed to every client.
-      this.db.exec("SAVEPOINT emit");
+      await this.db.exec("SAVEPOINT emit");
       try {
-        const res = this.db
+        const res = await this.db
           .prepare("INSERT INTO events (id, type, ts, body) VALUES (?, ?, ?, ?)")
           .run(event.id, event.type, event.ts, "");
-        event.seq = Number(res.lastInsertRowid);
-        this.db.prepare("UPDATE events SET body = ? WHERE seq = ?").run(JSON.stringify(event), event.seq);
-        this.db.exec("RELEASE emit");
+        event.seq = Number(res.lastInsertRowid ?? 0);
+        if (!event.seq) {
+          const r = await this.db.prepare("SELECT seq FROM events WHERE id = ?").get(event.id) as { seq: number };
+          event.seq = r.seq;
+        }
+        await this.db.prepare("UPDATE events SET body = ? WHERE seq = ?").run(JSON.stringify(event), event.seq);
+        await this.db.exec("RELEASE emit");
       } catch (err) {
-        this.db.exec("ROLLBACK TO emit");
-        this.db.exec("RELEASE emit");
+        await this.db.exec("ROLLBACK TO emit");
+        await this.db.exec("RELEASE emit");
         throw err;
       }
     }
     for (const s of this.subscribers) {
-      if ((audience === "all" || (audience === "agent") === (s.principal.kind === "agent")) && this.visible(event, s.principal)) {
+      if ((audience === "all" || (audience === "agent") === (s.principal.kind === "agent")) && (await this.visible(event, s.principal))) {
         try {
           s.send(event);
         } catch {
@@ -81,12 +85,12 @@ export class EventLog {
    * A page of persisted events after `afterSeq`. With a principal, events it may
    * not see are left out (the page may then hold fewer than `limit`).
    */
-  list(
+  async list(
     afterSeq: number,
     limit: number,
     principal?: Principal,
-  ): { events: Event[]; lastSeq: number; hasMore: boolean; nextAfterSeq: number } {
-    const rows = this.db
+  ): Promise<{ events: Event[]; lastSeq: number; hasMore: boolean; nextAfterSeq: number }> {
+    const rows = await this.db
       .prepare("SELECT seq, body FROM events WHERE seq > ? ORDER BY seq LIMIT ?")
       .all(afterSeq, limit + 1) as Array<{ seq: number; body: string }>;
     const hasMore = rows.length > limit;
@@ -94,12 +98,16 @@ export class EventLog {
     const page = window.flatMap((r) => parseEvent(r.body));
     // The cursor follows the rows, not the parsed events, so a bad row can't block it.
     const nextAfterSeq = window.at(-1)?.seq ?? afterSeq;
-    const events = principal ? page.filter((e) => this.visible(e, principal)) : page;
-    return { events, lastSeq: this.lastSeq(), hasMore, nextAfterSeq };
+    let events = page;
+    if (principal) {
+      const flags = await Promise.all(page.map((e) => Promise.resolve(this.visible(e, principal))));
+      events = page.filter((_, i) => flags[i]);
+    }
+    return { events, lastSeq: await this.lastSeq(), hasMore, nextAfterSeq };
   }
 
-  lastSeq(): number {
-    const row = this.db.prepare("SELECT MAX(seq) AS s FROM events").get() as { s: number | null };
+  async lastSeq(): Promise<number> {
+    const row = await this.db.prepare("SELECT MAX(seq) AS s FROM events").get() as { s: number | null };
     return row.s ?? 0;
   }
 

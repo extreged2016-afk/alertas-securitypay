@@ -21,8 +21,8 @@ async function placeCall(b: Awaited<ReturnType<typeof app>>, payload: object = {
   return b.app.inject({ method: "POST", url: "/v1/calls", headers: AGENT, payload });
 }
 
-function eventsOf(b: Awaited<ReturnType<typeof app>>) {
-  return b.ctx.events.list(0, 500).events;
+async function eventsOf(b: Awaited<ReturnType<typeof app>>) {
+  return (await b.ctx.events.list(0, 500)).events;
 }
 
 describe("calls", () => {
@@ -50,7 +50,7 @@ describe("calls", () => {
       const rr = await b.app.inject({ method: "POST", url: `/v1/calls/${call.call_id}/ringing`, headers: dev.headers });
       expect(rr.statusCode).toBe(204);
     }
-    expect(eventsOf(b).filter((e) => e.type === "call.ringing")).toHaveLength(1);
+    expect((await eventsOf(b)).filter((e) => e.type === "call.ringing")).toHaveLength(1);
 
     // status shows the open call
     const st = (await b.app.inject({ url: "/v1/status", headers: AGENT })).json();
@@ -79,7 +79,7 @@ describe("calls", () => {
     // idempotent
     expect((await b.app.inject({ method: "POST", url: `/v1/calls/${call.call_id}/end`, headers: AGENT })).json().state).toBe("ended");
 
-    const types = eventsOf(b).map((e) => e.type);
+    const types = (await eventsOf(b)).map((e) => e.type);
     expect(types).toEqual(["call.invite", "call.ringing", "call.accept", "call.end"]);
     await flush();
     // accept/decline don't affect other phones in a group call, so they aren't pushed
@@ -120,7 +120,7 @@ describe("calls", () => {
     });
     expect(b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", ended_by: "relay", end_reason: "room_closed" });
     expect(b.livekit.deleted).toEqual([call.call_id]);
-    const types = eventsOf(b).map((e) => e.type);
+    const types = (await eventsOf(b)).map((e) => e.type);
     expect(types).toEqual(["call.invite", "call.decline", "call.accept", "call.accept", "call.end"]);
   });
 
@@ -170,7 +170,7 @@ describe("calls", () => {
     expect(jb.statusCode).toBe(200);
     expect(jb.json().call).toMatchObject({ state: "active", device_id: a.device_id });
     expect(jb.json().join).toMatchObject({ room: call.call_id, identity: `device_${c.device_id}` });
-    expect(eventsOf(b).at(-1)).toMatchObject({ type: "call.accept", by: "user", device_id: c.device_id });
+    expect((await eventsOf(b)).at(-1)).toMatchObject({ type: "call.accept", by: "user", device_id: c.device_id });
     // pushed at normal priority to the other phones (not to the one that joined)
     await flush();
     expect(b.push.sent.map((s) => s.target.deviceId).sort()).toEqual([a.device_id, d.device_id].sort());
@@ -178,9 +178,9 @@ describe("calls", () => {
     expect(JSON.parse(b.push.sent[0]!.payload.event!)).toMatchObject({ type: "call.accept", device_id: c.device_id });
     // the phone that declined joins too; joining again only renews the token
     expect((await post(d.headers, "join")).statusCode).toBe(200);
-    const n = eventsOf(b).length;
+    const n = (await eventsOf(b)).length;
     expect((await post(d.headers, "join")).statusCode).toBe(200);
-    expect(eventsOf(b)).toHaveLength(n);
+    expect(await eventsOf(b)).toHaveLength(n);
 
     // A hangs up and comes back
     expect((await post(a.headers, "end")).json().state).toBe("active");
@@ -196,7 +196,7 @@ describe("calls", () => {
     // errors: unknown call, agent credentials
     expect((await post(a.headers, "join", "call_01JB0000000000000000000000")).statusCode).toBe(404);
     expect((await post(AGENT, "join")).statusCode).toBe(403);
-    const types = eventsOf(b).map((e) => e.type);
+    const types = (await eventsOf(b)).map((e) => e.type);
     expect(types).toEqual(["call.invite", "call.decline", "call.accept", "call.accept", "call.accept", "call.accept", "call.end"]);
   });
 
@@ -210,7 +210,7 @@ describe("calls", () => {
     expect(r.statusCode).toBe(200);
     expect(r.json().call).toMatchObject({ state: "active", device_id: a.device_id });
     expect(r.json().call.answered_at).toBeGreaterThan(0);
-    expect(eventsOf(b).map((e) => e.type)).toEqual(["call.invite", "call.decline", "call.accept"]);
+    expect((await eventsOf(b)).map((e) => e.type)).toEqual(["call.invite", "call.decline", "call.accept"]);
     // no ring timer left to fire on an answered call
     expect((await b.app.inject({ method: "POST", url: `/v1/calls/${call.call_id}/end`, headers: AGENT })).json().state).toBe("ended");
     const j = await b.app.inject({ method: "POST", url: `/v1/calls/${call.call_id}/join`, headers: a.headers });
@@ -254,7 +254,7 @@ describe("calls", () => {
     expect(b.ctx.calls!.get(call.call_id)!.state).toBe("ringing");
     vi.advanceTimersByTime(1_500);
     expect(b.ctx.calls!.get(call.call_id)!.state).toBe("missed");
-    expect(eventsOf(b).at(-1)).toMatchObject({ type: "call.missed", call_id: call.call_id });
+    expect((await eventsOf(b)).at(-1)).toMatchObject({ type: "call.missed", call_id: call.call_id });
     expect(b.livekit.deleted).toEqual([call.call_id]);
     // A new call can be placed now.
     expect((await placeCall(b)).statusCode).toBe(201);
@@ -272,7 +272,7 @@ describe("calls", () => {
     const c2 = (await placeCall(b)).json().call;
     const e = await b.app.inject({ method: "POST", url: `/v1/calls/${c2.call_id}/end`, headers: AGENT });
     expect(e.json()).toMatchObject({ state: "canceled", ended_by: "agent", end_reason: "canceled" });
-    expect(eventsOf(b).at(-1)).toMatchObject({ type: "call.end", reason: "canceled", by: "agent" });
+    expect((await eventsOf(b)).at(-1)).toMatchObject({ type: "call.end", reason: "canceled", by: "agent" });
     // Accepting a canceled call fails.
     expect((await b.app.inject({ method: "POST", url: `/v1/calls/${c2.call_id}/accept`, headers: dev.headers })).statusCode).toBe(409);
   });
@@ -348,7 +348,7 @@ describe("calls", () => {
 
       // only A gets the invite, and the event names its targets
       expect(pushedTo(b, "call.invite")).toEqual([a.device_id]);
-      expect(eventsOf(b).find((e) => e.type === "call.invite")).toMatchObject({ device_ids: [a.device_id] });
+      expect((await eventsOf(b)).find((e) => e.type === "call.invite")).toMatchObject({ device_ids: [a.device_id] });
 
       const post = (h: { authorization: string }, action: string) =>
         b.app.inject({ method: "POST", url: `/v1/calls/${call.call_id}/${action}`, headers: h });
@@ -359,7 +359,7 @@ describe("calls", () => {
         expect(res.json().error.code).toBe("forbidden");
       }
       expect((await post(other.headers, "ringing")).statusCode).toBe(204);
-      expect(eventsOf(b).filter((e) => e.type === "call.ringing")).toHaveLength(0);
+      expect((await eventsOf(b)).filter((e) => e.type === "call.ringing")).toHaveLength(0);
       expect((await b.app.inject({ url: `/v1/calls/${call.call_id}`, headers: other.headers })).statusCode).toBe(404);
       expect((await b.app.inject({ url: "/v1/calls", headers: other.headers })).json().calls).toEqual([]);
       expect((await b.app.inject({ url: "/v1/status", headers: other.headers })).json().active_call).toBeNull();
@@ -405,7 +405,7 @@ describe("calls", () => {
       b.ctx.hub.isAgentOnline = () => true;
       const fromPhone = await b.app.inject({ method: "POST", url: "/v1/calls", headers: a.headers, payload: { device_ids: [a.device_id] } });
       expect(fromPhone.statusCode).toBe(400);
-      expect(eventsOf(b).filter((e) => e.type === "call.invite")).toHaveLength(0);
+      expect((await eventsOf(b)).filter((e) => e.type === "call.invite")).toHaveLength(0);
     });
 
     it("the WebSocket of a non-targeted phone gets none of the call's events, live or on replay", async () => {

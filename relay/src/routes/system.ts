@@ -11,6 +11,7 @@ export function systemRoutes(app: FastifyInstance, ctx: Ctx): void {
   app.get("/healthz", async () => ({ ok: true }));
 
   app.get("/v1/status", { preHandler: auth }, async (req) => {
+    const open = await ctx.calls?.open();
     const body: Schemas["Status"] = {
       relay_id: ctx.relayId,
       version: VERSION,
@@ -18,13 +19,10 @@ export function systemRoutes(app: FastifyInstance, ctx: Ctx): void {
       agent_online: ctx.hub.isAgentOnline(),
       push_provider: ctx.pushProviderName,
       voice_enabled: Boolean(ctx.livekit),
-      active_call: (() => {
-        const open = ctx.calls?.open();
-        return open && canSee(open, principal(req)) ? callFromRow(open) : null;
-      })(),
+      active_call: open && canSee(open, principal(req)) ? callFromRow(open) : null,
     };
     if (principal(req).kind === "agent") {
-      const row = ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
+      const row = await ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
       body.device_count = row.n;
     }
     return body;
@@ -45,7 +43,7 @@ export function systemRoutes(app: FastifyInstance, ctx: Ctx): void {
       },
     },
     async (req) => {
-      const page = ctx.events.list(req.query.after_seq ?? 0, req.query.limit ?? 100, principal(req));
+      const page = await ctx.events.list(req.query.after_seq ?? 0, req.query.limit ?? 100, principal(req));
       return { events: page.events, last_seq: page.lastSeq, has_more: page.hasMore, next_after_seq: page.nextAfterSeq };
     },
   );

@@ -13,7 +13,7 @@ const CALL_UPDATE_TTL_S = 30;
 const CALL_JOINABLE_TTL_S = 3600;
 
 /** Just enough of a call for push routing; `device_ids` = the phones a targeted call rings. */
-export type CallLookup = (callId: string) => { direction: string; device_ids?: string[] } | undefined;
+export type CallLookup = (callId: string) => Promise<{ direction: string; device_ids?: string[] } | undefined>;
 
 export function signEvent(pushSecret: string, eventJson: string): string {
   return createHmac("sha256", Buffer.from(pushSecret, "base64url")).update(eventJson, "utf8").digest("base64url");
@@ -46,7 +46,7 @@ interface PushRule {
 }
 
 /** Which events wake the phone. Everything else is delivered over the WebSocket only. */
-function ruleFor(event: Event, getCall: CallLookup): PushRule | undefined {
+async function ruleFor(event: Event, getCall: CallLookup): Promise<PushRule | undefined> {
   switch (event.type) {
     case "alert.new":
       // A locked phone must ring even in Doze; the app shows the alarm itself.
@@ -66,14 +66,14 @@ function ruleFor(event: Event, getCall: CallLookup): PushRule | undefined {
       // that never got the invite). Normal priority: it doesn't need to wake a phone
       // in Doze, and a high-priority push that shows nothing (the phones still
       // ringing) gets the app's later pushes deprioritized.
-      return event.by === "user" && getCall(event.call_id)?.direction === "agent_to_user"
+      return event.by === "user" && (await getCall(event.call_id))?.direction === "agent_to_user"
         ? { ttlSeconds: CALL_JOINABLE_TTL_S, highPriority: false }
         : undefined;
     // call.decline is not pushed: in a group call one phone declining doesn't affect the others.
     case "call.end":
     case "call.missed":
       // Stops the ringing on every device (or tears down the call screen).
-      return getCall(event.call_id)?.direction === "agent_to_user"
+      return (await getCall(event.call_id))?.direction === "agent_to_user"
         ? { ttlSeconds: CALL_UPDATE_TTL_S, highPriority: true }
         : undefined;
     default:
@@ -87,18 +87,19 @@ export class PushDispatcher {
     private readonly provider: PushProvider | undefined,
     private readonly relayId: string,
     private readonly log: FastifyBaseLogger,
-    private readonly getCall: CallLookup = () => undefined,
+    private readonly getCall: CallLookup = async () => undefined,
   ) {}
 
-  handle(event: Event): void {
+  async handle(event: Event): Promise<void> {
     if (!this.provider) return;
-    const rule = ruleFor(event, this.getCall);
+    const rule = await ruleFor(event, this.getCall);
     if (!rule) return;
-    const devices = this.db
+    const devices = await this.db
       .prepare("SELECT device_id, push_secret, fcm_token FROM devices WHERE revoked_at IS NULL AND fcm_token IS NOT NULL")
       .all() as Array<{ device_id: string; push_secret: string; fcm_token: string }>;
     // A targeted call's pushes only go to the phones it targets.
-    const targets = event.type.startsWith("call.") ? this.getCall((event as { call_id: string }).call_id)?.device_ids : undefined;
+    const callInfo = event.type.startsWith("call.") ? await this.getCall((event as { call_id: string }).call_id) : undefined;
+    const targets = callInfo?.device_ids;
     for (const d of devices) {
       if (targets && !targets.includes(d.device_id)) continue;
       // The phone that joined already knows.
@@ -106,14 +107,14 @@ export class PushDispatcher {
       const payload = buildPayload(this.relayId, d.push_secret, event);
       void this.provider
         .send({ deviceId: d.device_id, token: d.fcm_token }, payload, rule)
-        .then((res) => {
+        .then(async (res) => {
           if (res.ok) {
             this.log.debug({ device: d.device_id, event: event.type }, "push sent");
             return;
           }
           this.log.warn({ device: d.device_id, event: event.type, error: res.error }, "push failed");
           if (res.unregistered) {
-            this.db
+            await this.db
               .prepare("UPDATE devices SET fcm_token = NULL WHERE device_id = ? AND fcm_token = ?")
               .run(d.device_id, d.fcm_token);
           }
