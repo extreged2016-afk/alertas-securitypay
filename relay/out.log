@@ -1,0 +1,10 @@
+{"level":40,"time":1794754413500,"pid":5228,"hostname":"Juanp-2026","msg":"Push is not configured: the phone will only get events while the app is open"}
+{"level":40,"time":1794754413501,"pid":5228,"hostname":"Juanp-2026","msg":"LiveKit is not configured: calls are disabled"}
+{"level":30,"time":1794754413562,"pid":5228,"hostname":"Juanp-2026","msg":"Server listening at http://127.0.0.1:8099"}
+{"level":30,"time":1794754413562,"pid":5228,"hostname":"Juanp-2026","msg":"Server listening at http://100.89.176.48:8099"}
+{"level":30,"time":1794754413562,"pid":5228,"hostname":"Juanp-2026","msg":"Server listening at http://192.168.30.53:8099"}
+{"level":30,"time":1794754413562,"pid":5228,"hostname":"Juanp-2026","relay_id":"rly_01M7FV5B2YCNZ5CY7476RSV0FR","public_url":"http://127.0.0.1:8099","push":"none","msg":"securitypay relay ready"}
+{"level":30,"time":1794754416804,"pid":5228,"hostname":"Juanp-2026","reqId":"req-1","req":{"method":"GET","url":"/v1/alerts?limit=1","host":"127.0.0.1:8099","remoteAddress":"127.0.0.1","remotePort":60158},"msg":"incoming request"}
+{"level":30,"time":1794754416809,"pid":5228,"hostname":"Juanp-2026","reqId":"req-1","res":{"statusCode":200},"responseTime":4.295500000000175,"msg":"request completed"}
+{"level":30,"time":1794754416867,"pid":5228,"hostname":"Juanp-2026","reqId":"req-2","req":{"method":"POST","url":"/v1/alerts/alert_01M7FV5SKRFHV7YX83EY857ZVJ/ack","host":"127.0.0.1:8099","remoteAddress":"127.0.0.1","remotePort":60159},"msg":"incoming request"}
+{"level":30,"time":1794754416869,"pid":5228,"hostname":"Juanp-2026","reqId":"req-2","res":{"statusCode":200},"responseTime":2.4882000000002336,"msg":"request completed"}

@@ -1,0 +1,13 @@
+{
+  "name": "alert-securitypay-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend Node.js de ejemplo que envía alertas a Alert SecurityPay",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

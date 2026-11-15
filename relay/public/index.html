@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#07111f" />
+    <meta name="description" content="Panel de alertas de Alert SecurityPay" />
+    <title>Alert SecurityPay · Centro de alertas</title>
+    <link rel="manifest" href="/panel/manifest.webmanifest" />
+    <link rel="icon" href="/panel/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/panel/styles.css" />
+  </head>
+  <body>
+    <div id="login" class="login">
+      <div class="login-card">
+        <div class="brand">
+          <img src="/panel/icon.svg" alt="" class="brand-logo" />
+          <div>
+            <div class="brand-name">Alert <span>SecurityPay</span></div>
+            <div class="brand-sub">Centro de alertas ilimitado · autohospedado</div>
+          </div>
+        </div>
+        <h1>Conecta tu panel</h1>
+        <p class="muted">
+          Pega la clave de API del relay (<code>ak_...</code>). La encuentras en los logs del
+          servidor o en <code>/data/api_key</code>.
+        </p>
+        <label for="relay-url">URL del relay</label>
+        <input id="relay-url" type="url" spellcheck="false" autocomplete="url" />
+        <label for="api-key">Clave de API</label>
+        <input id="api-key" type="password" spellcheck="false" autocomplete="off" placeholder="ak_..." />
+        <button id="login-btn" class="primary">Entrar</button>
+        <p id="login-error" class="error" role="alert"></p>
+        <p class="muted small">
+          ¿Aún no tienes relay? Despliega el proyecto en Render o Docker. Todo es tuyo y sin límites.
+        </p>
+      </div>
+    </div>
+
+    <div id="app" class="app hidden">
+      <header class="topbar">
+        <div class="brand small-brand">
+          <img src="/panel/icon.svg" alt="" class="brand-logo" />
+          <div class="brand-name">Alert <span>SecurityPay</span></div>
+        </div>
+        <div class="top-actions">
+          <span id="ws-pill" class="pill offline"><i></i><span>Desconectado</span></span>
+          <button id="sound-btn" class="ghost" title="Activar o silenciar la alarma">🔔 Activar sonido</button>
+          <button id="notify-btn" class="ghost" title="Permitir notificaciones del navegador">Permitir avisos</button>
+          <button id="logout-btn" class="ghost">Salir</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">Panel de control</p>
+            <h1>Todo tu sistema, bajo control.</h1>
+            <p class="muted">
+              Recibe alertas por push, WebSocket y voz. Esta página se actualiza en vivo y guarda
+              el historial en tu relay.
+            </p>
+          </div>
+          <div class="hero-actions">
+            <button id="pair-btn" class="primary">Emparejar teléfono</button>
+            <button id="test-btn" class="secondary">Probar alerta</button>
+          </div>
+        </section>
+
+        <section class="stats" id="stats">
+          <article class="stat"><span class="stat-label">Alertas totales</span><strong id="stat-total">0</strong></article>
+          <article class="stat critical"><span class="stat-label">Críticas sin atender</span><strong id="stat-critical">0</strong></article>
+          <article class="stat"><span class="stat-label">Últimas 24 h</span><strong id="stat-today">0</strong></article>
+          <article class="stat"><span class="stat-label">Canal en vivo</span><strong id="stat-channel">—</strong></article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Historial de alertas</h2>
+              <p class="muted small">Persistido en tu relay. Se actualiza por WebSocket.</p>
+            </div>
+            <div class="filters" role="group" aria-label="Filtrar alertas">
+              <button class="chip active" data-filter="all">Todas</button>
+              <button class="chip" data-filter="critical">Críticas</button>
+              <button class="chip" data-filter="high">Altas</button>
+              <button class="chip" data-filter="normal">Normales</button>
+              <button id="refresh-btn" class="chip">Actualizar</button>
+            </div>
+          </div>
+          <div id="alerts" class="alerts"></div>
+          <div id="empty" class="empty hidden">
+            <img src="/panel/icon.svg" alt="" />
+            <h3>Sin alertas todavía</h3>
+            <p class="muted">Envía una de prueba o conecta tu backend de Node.js en Render.</p>
+          </div>
+        </section>
+
+        <section class="panel grid-2">
+          <div>
+            <h2>Conexión para tu backend</h2>
+            <p class="muted small">Copia y pega en tu servicio de Render, n8n o script.</p>
+            <pre id="backend-snippet" class="code"></pre>
+            <button id="copy-snippet" class="secondary">Copiar ejemplo</button>
+          </div>
+          <div>
+            <h2>Canales activos</h2>
+            <div class="channel-row"><span>WebSocket</span><code id="ws-url">—</code></div>
+            <div class="channel-row"><span>Push FCM</span><code id="push-state">—</code></div>
+            <div class="channel-row"><span>LiveKit (voz)</span><code id="voice-state">—</code></div>
+            <div class="channel-row"><span>Relay</span><code id="relay-version">—</code></div>
+            <p class="muted small">
+              Las alertas críticas abren una sala de LiveKit. Si el agente de voz no está
+              desplegado, el teléfono y este panel usan la voz del sistema.
+            </p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="pair-dialog">
+      <div class="dialog-head">
+        <h2>Emparejar teléfono</h2>
+        <button id="pair-close" class="icon-btn" aria-label="Cerrar">✕</button>
+      </div>
+      <p class="muted">Abre Alert SecurityPay en Android y escanea este código. Caduca en 10 minutos.</p>
+      <div id="qr-wrap" class="qr-wrap"><div class="spinner"></div></div>
+      <ol class="steps">
+        <li>Instala la APK en el móvil.</li>
+        <li>Abre la app y pulsa <strong>Escanear código QR</strong>.</li>
+        <li>Listo: la app queda conectada por WebSocket y push.</li>
+      </ol>
+    </dialog>
+
+    <dialog id="test-dialog">
+      <div class="dialog-head">
+        <h2>Probar alerta</h2>
+        <button id="test-close" class="icon-btn" aria-label="Cerrar">✕</button>
+      </div>
+      <label for="test-title">Título</label>
+      <input id="test-title" value="Prueba de Alert SecurityPay" />
+      <label for="test-message">Mensaje</label>
+      <textarea id="test-message" rows="3">Si ves esta alerta, el sistema funciona correctamente.</textarea>
+      <label for="test-priority">Prioridad</label>
+      <select id="test-priority">
+        <option value="normal">Normal</option>
+        <option value="high">Alta</option>
+        <option value="critical" selected>Crítica (alarma + voz)</option>
+      </select>
+      <div class="dialog-actions">
+        <button id="test-cancel" class="ghost">Cancelar</button>
+        <button id="test-send" class="primary">Enviar alerta</button>
+      </div>
+    </dialog>
+
+    <template id="alert-template">
+      <article class="alert">
+        <div class="alert-priority"></div>
+        <div class="alert-body">
+          <div class="alert-top">
+            <span class="alert-type"></span>
+            <time class="alert-time"></time>
+          </div>
+          <h3 class="alert-title"></h3>
+          <p class="alert-message"></p>
+          <div class="alert-meta">
+            <span class="alert-source"></span>
+            <span class="alert-acked"></span>
+          </div>
+          <div class="alert-actions">
+            <button class="secondary ack">Marcar como atendida</button>
+            <button class="ghost listen hidden">Escuchar de nuevo</button>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script type="module" src="/panel/app.js"></script>
+  </body>
+</html>

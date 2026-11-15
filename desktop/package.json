@@ -1,0 +1,24 @@
+{
+  "name": "alert-securitypay-desktop",
+  "productName": "Alert SecurityPay",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Centro de alertas de Alert SecurityPay para escritorio",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.securitypay.alerts.desktop",
+    "productName": "Alert SecurityPay",
+    "files": ["main.js", "preload.js", "config.json"],
+    "win": { "target": "nsis" },
+    "linux": { "target": "AppImage" },
+    "mac": { "target": "dmg" }
+  }
+}

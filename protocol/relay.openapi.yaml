@@ -1,0 +1,1319 @@
+openapi: 3.1.0
+info:
+  title: securitypay relay API
+  version: 1.0.0-draft
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    REST commands + event stream between the agent daemon, the Android app and
+    the relay. See docs/protocol.md for flows.
+
+    Conventions:
+    - IDs are prefixed ULIDs (`dev_`, `call_`, `msg_`, `evt_`, `rly_`).
+    - Timestamps are integer milliseconds since the Unix epoch (UTC).
+    - Errors use the `Error` schema.
+servers:
+  - url: https://relay.example.com
+tags:
+  - name: pairing
+  - name: devices
+  - name: calls
+  - name: messages
+  - name: alerts
+  - name: events
+  - name: system
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness probe.
+      security: []
+      responses:
+        "200":
+          description: Relay is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { const: true }
+
+  /v1/status:
+    get:
+      tags: [system]
+      operationId: getStatus
+      summary: Relay status, agent presence and active call.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Relay and peer status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/pairing-tokens:
+    post:
+      tags: [pairing]
+      operationId: createPairingToken
+      summary: Create a single-use pairing token (agent only).
+      description: |
+        Needs the API key: a short-lived agent token (`at_…`, hub mode) gets `403`, so it
+        can't leave behind a credential that outlives it. Rotating the key deletes the
+        tenant's unused pairing tokens.
+      security: [{ agentKey: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ttl_s:
+                  type: integer
+                  minimum: 30
+                  maximum: 600
+                  default: 600
+      responses:
+        "201":
+          description: Token created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairingToken" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/pair:
+    post:
+      tags: [pairing]
+      operationId: pair
+      summary: Redeem a pairing token and register a device.
+      description: |
+        Unauthenticated; the pairing token is the credential. The token is
+        consumed on success. Invalid, expired and already-used tokens all
+        return 401 `invalid_pairing_token`. Rate limited per IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PairRequest" }
+      responses:
+        "201":
+          description: Device registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairResponse" }
+        "402": { $ref: "#/components/responses/QuotaExceeded" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/device/fcm:
+    post:
+      tags: [devices]
+      operationId: updateFcmToken
+      summary: Update the calling device's FCM registration token.
+      security: [{ deviceJwt: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fcm_token]
+              properties:
+                fcm_token: { type: string, minLength: 1, maxLength: 4096 }
+      responses:
+        "204": { description: Updated. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/devices:
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: List paired devices (agent only).
+      security: [{ agentKey: [] }]
+      parameters:
+        - name: include_revoked
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Paired devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/devices/{device_id}:
+    parameters:
+      - $ref: "#/components/parameters/DeviceId"
+    delete:
+      tags: [devices]
+      operationId: revokeDevice
+      summary: Revoke a device. Its JWT stops working immediately.
+      description: |
+        Needs the API key, not a short-lived agent token. If the phone is on the open
+        call, the call ends and its room closes; if it is only ringing there, it stops
+        counting, and a call left with no phone is `canceled`.
+      security: [{ agentKey: [] }]
+      responses:
+        "204": { description: Revoked (idempotent). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/calls:
+    post:
+      tags: [calls]
+      operationId: createCall
+      summary: Start a call. Agent → rings the user's devices; device → calls the agent.
+      description: |
+        The caller receives its LiveKit join info immediately. The callee
+        receives a `call.invite` event and gets its join info from
+        `POST /v1/calls/{call_id}/accept`.
+
+        Targeted calls: the agent may pass `device_ids` to ring only those phones.
+        The call is then private to them: the other phones get none of its events
+        (WebSocket, push or `GET /v1/events`), do not see it in `GET /v1/calls`,
+        `GET /v1/calls/{call_id}` and `POST /v1/calls/{call_id}/end` (404) or
+        `active_call` in `GET /v1/status`, and cannot accept, decline or join it (403).
+
+        On a plan with a call-time limit (hub mode), `429 rate_limited` after 20
+        unanswered calls in an hour. A self-hosted relay has no such limit.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCallRequest" }
+      responses:
+        "201":
+          description: Call created, state `ringing`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallWithJoin" }
+        "402": { $ref: "#/components/responses/QuotaExceeded" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "400":
+          description: "`invalid_request`, e.g. a missing `reason` (agent caller), an empty `device_ids`, an unknown or revoked device id, or `device_ids` sent by a device."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`busy` (another call is ringing/active) or `no_devices` (agent caller, nothing paired)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: "`agent_offline` (device caller, no daemon connected) or `calls_unavailable` (LiveKit is not configured on this relay)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      tags: [calls]
+      operationId: listCalls
+      summary: Call history, newest first.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: before
+          in: query
+          description: Cursor; return calls with `call_id` lower than this.
+          schema: { $ref: "#/components/schemas/CallId" }
+      responses:
+        "200":
+          description: Calls.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [calls]
+                properties:
+                  calls:
+                    type: array
+                    items: { $ref: "#/components/schemas/Call" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/calls/{call_id}:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    get:
+      tags: [calls]
+      operationId: getCall
+      summary: Get one call.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Call.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Call" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/calls/{call_id}/ringing:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    post:
+      tags: [calls]
+      operationId: reportRinging
+      summary: Device reports it is showing the incoming call UI.
+      security: [{ deviceJwt: [] }]
+      responses:
+        "204": { description: Recorded (idempotent; ignored if no longer ringing). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/calls/{call_id}/accept:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    post:
+      tags: [calls]
+      operationId: acceptCall
+      summary: Callee accepts. For agent calls, any paired phone may answer while the call rings.
+      description: |
+        Group calls: every paired phone rings and each may answer until `expires_at`;
+        all of them join the same LiveKit room. The first answer moves the call to
+        `active`. A phone that already joined may accept again while the call is
+        active (rejoin after a drop, new token). Otherwise `409 invalid_state`; a
+        phone that missed its ring window, declined or left uses
+        `POST /v1/calls/{call_id}/join` instead.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Accepted; state `active`. Contains the callee's join info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallWithJoin" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidState" }
+
+  /v1/calls/{call_id}/join:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    post:
+      tags: [calls]
+      operationId: joinCall
+      summary: A paired phone joins an agent call at any time while it is ringing or active.
+      description: |
+        "Join the call": unlike `accept`, this works for any paired phone that is not
+        on the call, also after its ring window (`expires_at`), after declining, or
+        after hanging up, as long as the call is `ringing` or `active`. While the call
+        still rings it is the same as accepting (the call becomes `active`). Emits
+        `call.accept` with this phone's `device_id` (once per phone that joins); a
+        phone already on the call just gets a new token (no event). Only agent calls
+        (`agent_to_user`) can be joined, and a targeted call (`device_ids`) only by
+        the phones it targets.
+      security: [{ deviceJwt: [] }]
+      responses:
+        "200":
+          description: Joined; state `active`. Contains this phone's join info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallWithJoin" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`forbidden` (not an agent call, or a targeted call this phone is not in)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`call_ended` (the call is `ended`, `missed`, `declined` or `canceled`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: "`calls_unavailable` (LiveKit is not configured on this relay)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/calls/{call_id}/decline:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    post:
+      tags: [calls]
+      operationId: declineCall
+      summary: Callee declines a ringing call.
+      description: |
+        A phone declining only stops its own ringing (event `call.decline` with its
+        `device_id`); the call becomes `declined` when no phone is left ringing or on
+        the call.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Declined; state `declined`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Call" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidState" }
+
+  /v1/calls/{call_id}/end:
+    parameters:
+      - $ref: "#/components/parameters/CallId"
+    post:
+      tags: [calls]
+      operationId: endCall
+      summary: Hang up. While ringing, only the caller may call this (→ `canceled`).
+      description: |
+        On an active agent call a phone only leaves; the call ends (`ended`) when the
+        agent hangs up or the last phone leaves (after the ring window, or once no
+        other phone is still ringing). A call to the agent belongs to the phone that
+        placed it: any other phone gets `403`. A targeted call doesn't exist for phones
+        outside it: `404`, in every state.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: State `ended` or `canceled`. Idempotent on terminal states.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Call" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/livekit/webhook:
+    post:
+      tags: [calls]
+      operationId: livekitWebhook
+      summary: LiveKit server webhook (room/participant events).
+      description: |
+        Called by the LiveKit server, not by clients. Authenticated with the
+        LiveKit webhook signature (a JWT signed with the LiveKit API secret that
+        carries the SHA-256 of the body). `room_finished`, or either party
+        leaving the room, ends an `active` call with `by: relay, reason: room_closed`.
+      security: [{ livekitWebhook: [] }]
+      requestBody:
+        required: true
+        content:
+          application/webhook+json:
+            schema: { type: object }
+      responses:
+        "200": { description: Processed (also for events that don't concern a call). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/messages:
+    post:
+      tags: [messages]
+      operationId: postMessage
+      summary: Send a message. `from` is derived from the credential.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostMessageRequest" }
+      responses:
+        "201":
+          description: Created (or the existing message for a repeated `client_msg_id`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "402": { $ref: "#/components/responses/QuotaExceeded" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    get:
+      tags: [messages]
+      operationId: listMessages
+      summary: Message history, oldest first.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      parameters:
+        - name: after
+          in: query
+          description: Cursor; return messages with `msg_id` greater than this.
+          schema: { $ref: "#/components/schemas/MsgId" }
+        - name: since
+          in: query
+          description: Return messages created at or after this time (ms).
+          schema: { $ref: "#/components/schemas/Timestamp" }
+        - name: from
+          in: query
+          schema: { $ref: "#/components/schemas/Party" }
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages, has_more]
+                properties:
+                  messages:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+                  has_more: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/messages/{msg_id}:
+    parameters:
+      - $ref: "#/components/parameters/MsgId"
+    get:
+      tags: [messages]
+      operationId: getMessage
+      summary: Get one message (e.g. after a truncated push).
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Message.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/messages/{msg_id}/read:
+    parameters:
+      - $ref: "#/components/parameters/MsgId"
+    post:
+      tags: [messages]
+      operationId: markMessageRead
+      summary: Mark a message from the other party as read (emits `msg.read` once).
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "204": { description: Marked (idempotent). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/events:
+    get:
+      tags: [events]
+      operationId: listEvents
+      summary: Catch up on persisted events (same content as the WS replay).
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AfterSeq"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Events ordered by `seq`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, last_seq, has_more]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/Event" }
+                  last_seq:
+                    description: Highest seq in the relay log (not just in this page).
+                    type: integer
+                    minimum: 0
+                  has_more: { type: boolean }
+                  next_after_seq:
+                    description: |
+                      Pass as `after_seq` for the next page. It can be past the last
+                      returned event when events this caller may not see (another
+                      phone's targeted call) were left out of the page.
+                    type: integer
+                    minimum: 0
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/alerts:
+    post:
+      tags: [alerts]
+      operationId: createAlert
+      summary: Create an alert and fan it out to phones, WebSocket clients and push.
+      description: |
+        The endpoint your cloud backend (Node.js, Render, n8n, scripts) calls. A
+        `critical` alert rings the phone and, when LiveKit is configured, creates a
+        voice room so the app can hear the alert spoken by the voice agent.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAlertRequest" }
+      responses:
+        "201":
+          description: Alert created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Alert" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    get:
+      tags: [alerts]
+      operationId: listAlerts
+      summary: Alert history, newest first.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: priority
+          in: query
+          schema: { type: string, enum: [low, normal, high, critical] }
+      responses:
+        "200":
+          description: Alerts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AlertPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/alerts/{alert_id}:
+    parameters:
+      - $ref: "#/components/parameters/AlertId"
+    get:
+      tags: [alerts]
+      operationId: getAlert
+      summary: One alert.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Alert.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Alert" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/alerts/{alert_id}/ack:
+    parameters:
+      - $ref: "#/components/parameters/AlertId"
+    post:
+      tags: [alerts]
+      operationId: ackAlert
+      summary: Acknowledge an alert (also stops the alarm on every phone).
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: Updated alert.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Alert" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/alerts/{alert_id}/voice-token:
+    parameters:
+      - $ref: "#/components/parameters/AlertId"
+    post:
+      tags: [alerts]
+      operationId: alertVoiceToken
+      summary: Join token for the alert's LiveKit room (listener or voice agent).
+      description: |
+        Devices receive a subscribe-only token. The API key receives a token that can
+        publish audio, which is what the voice-agent worker uses to speak the alert.
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      responses:
+        "200":
+          description: LiveKit join info.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/InvalidState" }
+
+  /v1/ws:
+    get:
+      tags: [events]
+      operationId: eventStream
+      summary: WebSocket event stream.
+      description: |
+        Upgrade to WebSocket. The server sends one JSON `Event` per text frame:
+        first `ws.hello`, then every persisted event with `seq > after_seq`,
+        then live events. Clients send nothing (ping/pong keepalive every 20 s; the
+        pong must echo the ping's payload, as WebSocket libraries do). Replay is paced
+        by the client: one that stops reading is dropped and resumes with `after_seq`.
+        Close codes: 4401 unauthorized/revoked or expired agent token, 4409 replaced by
+        a newer agent connection (only one daemon socket at a time), 1013 too many
+        sockets (a phone keeps its 4 newest; a relay or tenant holds 64).
+      security: [{ agentKey: [] }, { deviceJwt: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AfterSeq"
+      responses:
+        "101":
+          description: Switching protocols. Frames follow `#/components/schemas/Event`.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /ws/relay:
+    get:
+      tags: [events]
+      operationId: relaySocket
+      summary: Browser/desktop WebSocket stream (`?token=` or Bearer).
+      description: |
+        Same event stream as `/v1/ws`, for clients that cannot set headers (the
+        desktop panel, Electron, the voice-agent worker). Pass `token` as a query
+        parameter: an API key (`ak_...`) or a device JWT. Always use `wss://` on the
+        public internet; query strings may appear in proxy logs.
+      parameters:
+        - name: token
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: "#/components/parameters/AfterSeq"
+      responses:
+        "101":
+          description: Switching protocols.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    agentKey:
+      type: http
+      scheme: bearer
+      bearerFormat: "ak_<base64url>"
+      description: >-
+        Daemon API key (SECURITYPAY_API_KEY). In hub mode, a short-lived agent token
+        (`at_<base64url>`, from the hub admin API) is accepted in its place.
+    deviceJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: device_jwt obtained from POST /v1/pair.
+    livekitWebhook:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: LiveKit webhook signature (JWT signed with the LiveKit API secret).
+
+  parameters:
+    DeviceId:
+      name: device_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/DeviceId" }
+    CallId:
+      name: call_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/CallId" }
+    MsgId:
+      name: msg_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/MsgId" }
+    AlertId:
+      name: alert_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/AlertId" }
+    AfterSeq:
+      name: after_seq
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+
+  responses:
+    BadRequest:
+      description: "`invalid_request`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "`unauthorized` or `invalid_pairing_token`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: "`forbidden` (e.g. the caller tries to accept its own call)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "`not_found`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidState:
+      description: "`invalid_state` (e.g. call already accepted elsewhere, missed or ended)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: "`rate_limited`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    QuotaExceeded:
+      description: >-
+        `quota_exceeded`: only on a hosted relay (hub mode, docs/cloud.md), when the
+        tenant's plan limit for devices, call minutes or messages is reached.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    # ---------- primitives ----------
+    Timestamp:
+      description: Milliseconds since the Unix epoch (UTC).
+      type: integer
+      minimum: 0
+    RelayId:
+      type: string
+      pattern: "^rly_[0-9A-HJKMNP-TV-Z]{26}$"
+    DeviceId:
+      type: string
+      pattern: "^dev_[0-9A-HJKMNP-TV-Z]{26}$"
+    CallId:
+      type: string
+      pattern: "^call_[0-9A-HJKMNP-TV-Z]{26}$"
+    MsgId:
+      type: string
+      pattern: "^msg_[0-9A-HJKMNP-TV-Z]{26}$"
+    EventId:
+      type: string
+      pattern: "^evt_[0-9A-HJKMNP-TV-Z]{26}$"
+    Party:
+      description: A human-or-agent side of the conversation.
+      type: string
+      enum: [agent, user]
+    Actor:
+      type: string
+      enum: [agent, user, relay]
+    Priority:
+      type: string
+      enum: [normal, urgent]
+    CallDirection:
+      type: string
+      enum: [agent_to_user, user_to_agent]
+    CallState:
+      type: string
+      enum: [ringing, active, ended, missed, declined, canceled]
+    EndReason:
+      type: string
+      enum: [hangup, canceled, room_closed, error, quota]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: [invalid_request, unauthorized, invalid_pairing_token, forbidden, not_found, busy, no_devices, agent_offline, calls_unavailable, invalid_state, call_ended, rate_limited, quota_exceeded, tenant_disabled, internal]
+            message: { type: string }
+
+    # ---------- system ----------
+    Status:
+      type: object
+      required: [relay_id, version, agent_name, agent_online, push_provider]
+      properties:
+        relay_id: { $ref: "#/components/schemas/RelayId" }
+        version: { type: string }
+        agent_name: { type: string }
+        agent_online: { type: boolean }
+        push_provider: { type: string, examples: [fcm] }
+        voice_enabled:
+          description: LiveKit is configured, so critical alerts can be spoken in a room.
+          type: boolean
+        device_count:
+          description: Only returned to the agent.
+          type: integer
+        active_call:
+          description: The call currently ringing or active, if any.
+          oneOf:
+            - $ref: "#/components/schemas/Call"
+            - type: "null"
+
+    # ---------- pairing / devices ----------
+    PairingToken:
+      type: object
+      required: [pairing_token, expires_at, qr_payload]
+      properties:
+        pairing_token:
+          type: string
+          pattern: "^pt_[A-Za-z0-9_-]{43}$"
+        expires_at: { $ref: "#/components/schemas/Timestamp" }
+        qr_payload:
+          description: Exact string to encode in the QR (compact JSON of `QrPayload`).
+          type: string
+      example:
+        pairing_token: pt_q8Vx0m3cJ5a1n1wYg7Kc9b2dE4fH6iL8oP0rS2tU4vW
+        expires_at: 1761200600000
+        qr_payload: '{"v":1,"relay_url":"https://relay.example.com","pairing_token":"pt_q8Vx0m3cJ5a1n1wYg7Kc9b2dE4fH6iL8oP0rS2tU4vW"}'
+    QrPayload:
+      type: object
+      required: [v, relay_url, pairing_token]
+      properties:
+        v: { const: 1 }
+        relay_url: { type: string, format: uri }
+        pairing_token: { type: string }
+    PairRequest:
+      type: object
+      additionalProperties: false
+      required: [pairing_token, device_name, platform]
+      properties:
+        pairing_token: { type: string }
+        fcm_token:
+          description: May be omitted if not yet available; send later via /v1/device/fcm.
+          type: string
+          maxLength: 4096
+        device_name: { type: string, minLength: 1, maxLength: 64 }
+        platform: { type: string, enum: [android] }
+        app_version: { type: string, maxLength: 32 }
+    PairResponse:
+      type: object
+      required: [device_id, device_jwt, push_secret, relay_id, agent_name, push_config]
+      properties:
+        device_id: { $ref: "#/components/schemas/DeviceId" }
+        device_jwt: { type: string }
+        push_secret:
+          description: base64url, 32 bytes. Key for HMAC-SHA256 over push `event` field.
+          type: string
+        relay_id: { $ref: "#/components/schemas/RelayId" }
+        agent_name: { type: string }
+        push_config: { $ref: "#/components/schemas/PushConfig" }
+    PushConfig:
+      description: |
+        How the app should register for push. Lets one prebuilt APK work with
+        any user's own Firebase project: the app initialises Firebase at
+        runtime with these public client values instead of a compiled-in
+        google-services.json. `null` when the relay has no push configured.
+      oneOf:
+        - type: "null"
+        - type: object
+          required: [provider, fcm]
+          properties:
+            provider: { const: fcm }
+            fcm:
+              type: object
+              required: [project_id, application_id, api_key, sender_id]
+              properties:
+                project_id: { type: string }
+                application_id: { type: string, description: "mobilesdk_app_id, e.g. 1:1234:android:abcd" }
+                api_key: { type: string }
+                sender_id: { type: string, description: "project_number" }
+    Device:
+      type: object
+      required: [device_id, name, platform, created_at, has_push_token]
+      properties:
+        device_id: { $ref: "#/components/schemas/DeviceId" }
+        name: { type: string }
+        platform: { type: string, enum: [android] }
+        app_version: { type: string }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        last_seen_at: { $ref: "#/components/schemas/Timestamp" }
+        revoked_at: { $ref: "#/components/schemas/Timestamp" }
+        has_push_token: { type: boolean }
+
+    # ---------- calls ----------
+    CreateCallRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          description: Required when the agent calls; optional when the user calls.
+          type: string
+          maxLength: 500
+        priority:
+          $ref: "#/components/schemas/Priority"
+          default: normal
+        agent_name:
+          description: Display name override for this call (agent only).
+          type: string
+          maxLength: 64
+        device_ids:
+          description: |
+            Agent only: ring only these paired, non-revoked phones (a targeted
+            call) instead of every paired phone. Only they get the invite, can
+            answer, decline or join, and see the call at all. Duplicates are
+            ignored. Unknown or revoked ids, an empty list, or a device caller
+            sending it → `400 invalid_request`.
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/DeviceId" }
+    Call:
+      type: object
+      required: [call_id, direction, state, priority, agent_name, created_at]
+      properties:
+        call_id: { $ref: "#/components/schemas/CallId" }
+        direction: { $ref: "#/components/schemas/CallDirection" }
+        state: { $ref: "#/components/schemas/CallState" }
+        reason: { type: string }
+        priority: { $ref: "#/components/schemas/Priority" }
+        agent_name: { type: string }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        answered_at: { $ref: "#/components/schemas/Timestamp" }
+        ended_at: { $ref: "#/components/schemas/Timestamp" }
+        ended_by: { $ref: "#/components/schemas/Actor" }
+        end_reason: { $ref: "#/components/schemas/EndReason" }
+        duration_ms: { type: integer, minimum: 0 }
+        device_id:
+          description: Device that placed or answered the call.
+          $ref: "#/components/schemas/DeviceId"
+        device_ids:
+          description: Targeted call only; the phones it rings. Absent = every paired phone.
+          type: array
+          items: { $ref: "#/components/schemas/DeviceId" }
+    JoinInfo:
+      type: object
+      required: [livekit_url, livekit_token, room, identity, expires_at]
+      properties:
+        livekit_url: { type: string, format: uri, examples: ["wss://relay.example.com"] }
+        livekit_token:
+          description: Access token valid for this room only; TTL 120 s (join window).
+          type: string
+        room: { type: string, examples: [call_01JB0000000000000000000000] }
+        identity: { type: string, examples: [agent, device_dev_01JB0000000000000000000000] }
+        expires_at: { $ref: "#/components/schemas/Timestamp" }
+    CallWithJoin:
+      type: object
+      required: [call, join]
+      properties:
+        call: { $ref: "#/components/schemas/Call" }
+        join: { $ref: "#/components/schemas/JoinInfo" }
+
+    # ---------- alerts ----------
+    AlertId:
+      type: string
+      pattern: "^alert_"
+      examples: [alert_01JB0000000000000000000000]
+    AlertPriority:
+      type: string
+      enum: [low, normal, high, critical]
+      description: |
+        `critical` rings the alarm and starts the LiveKit voice announcement.
+        `high` rings the alarm. `normal` shows a notification. `low` is history only.
+    Alert:
+      type: object
+      required: [alert_id, type, title, message, priority, source, created_at]
+      properties:
+        alert_id: { $ref: "#/components/schemas/AlertId" }
+        type:
+          type: string
+          description: Free-form category, e.g. error, outage, security, deploy, message.
+          examples: [error]
+        title: { type: string, maxLength: 200 }
+        message: { type: string, maxLength: 4000 }
+        priority: { $ref: "#/components/schemas/AlertPriority" }
+        source: { type: string, maxLength: 120, examples: [render-api] }
+        data:
+          type: object
+          additionalProperties: true
+          description: Free-form JSON metadata from your backend.
+        voice_room:
+          type: string
+          description: LiveKit room with the spoken announcement, when calls are configured.
+        voice_url:
+          type: string
+          description: LiveKit WebSocket URL for the app.
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        acked_at: { $ref: "#/components/schemas/Timestamp" }
+        acked_by: { type: string, enum: [agent, user] }
+    AlertPage:
+      type: object
+      required: [alerts]
+      properties:
+        alerts:
+          type: array
+          items: { $ref: "#/components/schemas/Alert" }
+    CreateAlertRequest:
+      type: object
+      additionalProperties: false
+      required: [type, title, message]
+      properties:
+        type: { type: string, minLength: 1, maxLength: 60 }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        message: { type: string, minLength: 1, maxLength: 4000 }
+        priority: { $ref: "#/components/schemas/AlertPriority" }
+        source: { type: string, minLength: 1, maxLength: 120 }
+        data:
+          type: object
+          additionalProperties: true
+        voice:
+          type: boolean
+          default: true
+          description: Create a LiveKit room and voice announcement for critical alerts.
+        tts_text:
+          type: string
+          maxLength: 1200
+          description: Optional text for the voice agent (defaults to title. message).
+
+    # ---------- messages ----------
+    PostMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1, maxLength: 4000 }
+        reply_to:
+          description: Optional msg_id or call_id this message responds to.
+          type: string
+        client_msg_id:
+          description: Idempotency key chosen by the sender (unique per sender).
+          type: string
+          maxLength: 64
+    Message:
+      type: object
+      required: [msg_id, from, text, created_at]
+      properties:
+        msg_id: { $ref: "#/components/schemas/MsgId" }
+        from: { $ref: "#/components/schemas/Party" }
+        text: { type: string }
+        reply_to: { type: string }
+        client_msg_id: { type: string }
+        device_id:
+          description: Sending device when `from` = user.
+          $ref: "#/components/schemas/DeviceId"
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        read_at: { $ref: "#/components/schemas/Timestamp" }
+
+    # ---------- events ----------
+    EventBase:
+      type: object
+      required: [type, id, ts]
+      properties:
+        type: { type: string }
+        id: { $ref: "#/components/schemas/EventId" }
+        ts: { $ref: "#/components/schemas/Timestamp" }
+        seq:
+          description: Position in the relay event log. Absent on ephemeral events.
+          type: integer
+          minimum: 1
+
+    Event:
+      oneOf:
+        - $ref: "#/components/schemas/CallInviteEvent"
+        - $ref: "#/components/schemas/CallRingingEvent"
+        - $ref: "#/components/schemas/CallAcceptEvent"
+        - $ref: "#/components/schemas/CallDeclineEvent"
+        - $ref: "#/components/schemas/CallEndEvent"
+        - $ref: "#/components/schemas/CallMissedEvent"
+        - $ref: "#/components/schemas/MsgNewEvent"
+        - $ref: "#/components/schemas/MsgReadEvent"
+        - $ref: "#/components/schemas/AlertNewEvent"
+        - $ref: "#/components/schemas/AlertAckEvent"
+        - $ref: "#/components/schemas/AgentPresenceEvent"
+        - $ref: "#/components/schemas/WsHelloEvent"
+      discriminator:
+        propertyName: type
+        mapping:
+          call.invite: "#/components/schemas/CallInviteEvent"
+          call.ringing: "#/components/schemas/CallRingingEvent"
+          call.accept: "#/components/schemas/CallAcceptEvent"
+          call.decline: "#/components/schemas/CallDeclineEvent"
+          call.end: "#/components/schemas/CallEndEvent"
+          call.missed: "#/components/schemas/CallMissedEvent"
+          msg.new: "#/components/schemas/MsgNewEvent"
+          msg.read: "#/components/schemas/MsgReadEvent"
+          alert.new: "#/components/schemas/AlertNewEvent"
+          alert.ack: "#/components/schemas/AlertAckEvent"
+          agent.presence: "#/components/schemas/AgentPresenceEvent"
+          ws.hello: "#/components/schemas/WsHelloEvent"
+
+    CallInviteEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id, direction, agent_name, reason, priority, expires_at]
+          properties:
+            type: { const: call.invite }
+            call_id: { $ref: "#/components/schemas/CallId" }
+            direction: { $ref: "#/components/schemas/CallDirection" }
+            agent_name: { type: string }
+            reason: { type: string, description: "Empty string if the user called without a reason." }
+            priority: { $ref: "#/components/schemas/Priority" }
+            expires_at:
+              description: Do not ring after this instant (= created + ring timeout).
+              $ref: "#/components/schemas/Timestamp"
+            device_ids:
+              description: |
+                Targeted call only; the phones it rings. The relay never delivers the
+                events of a targeted call to other phones, so clients need not filter.
+              type: array
+              items: { $ref: "#/components/schemas/DeviceId" }
+      example:
+        type: call.invite
+        id: evt_01JB0000000000000000000001
+        ts: 1761200000000
+        seq: 41
+        call_id: call_01JB0000000000000000000002
+        direction: agent_to_user
+        agent_name: Claude
+        reason: Deploy to prod is ready, need your go/no-go
+        priority: urgent
+        expires_at: 1761200030000
+
+    CallRingingEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id, device_id]
+          properties:
+            type: { const: call.ringing }
+            call_id: { $ref: "#/components/schemas/CallId" }
+            device_id: { $ref: "#/components/schemas/DeviceId" }
+
+    CallAcceptEvent:
+      description: |
+        A callee answered. In a group call, emitted once per phone that joins
+        (via `accept` or `join`). Pushed to the other phones at normal priority so
+        they can offer "join the call".
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id, by]
+          properties:
+            type: { const: call.accept }
+            call_id: { $ref: "#/components/schemas/CallId" }
+            by: { $ref: "#/components/schemas/Party" }
+            device_id: { $ref: "#/components/schemas/DeviceId" }
+
+    CallDeclineEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id, by]
+          properties:
+            type: { const: call.decline }
+            call_id: { $ref: "#/components/schemas/CallId" }
+            by: { $ref: "#/components/schemas/Party" }
+            device_id: { $ref: "#/components/schemas/DeviceId" }
+
+    CallEndEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id, by, reason]
+          properties:
+            type: { const: call.end }
+            call_id: { $ref: "#/components/schemas/CallId" }
+            by: { $ref: "#/components/schemas/Actor" }
+            reason: { $ref: "#/components/schemas/EndReason" }
+            duration_ms: { type: integer, minimum: 0 }
+
+    CallMissedEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, call_id]
+          properties:
+            type: { const: call.missed }
+            call_id: { $ref: "#/components/schemas/CallId" }
+
+    MsgNewEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, msg_id, from, text]
+          properties:
+            type: { const: msg.new }
+            msg_id: { $ref: "#/components/schemas/MsgId" }
+            from: { $ref: "#/components/schemas/Party" }
+            text: { type: string }
+            reply_to: { type: string }
+            truncated:
+              description: Only in push payloads; fetch the full message via GET /v1/messages/{msg_id}.
+              type: boolean
+      example:
+        type: msg.new
+        id: evt_01JB0000000000000000000003
+        ts: 1761200000000
+        seq: 42
+        msg_id: msg_01JB0000000000000000000004
+        from: agent
+        text: "Build finished ✅"
+
+    MsgReadEvent:
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, msg_id, by]
+          properties:
+            type: { const: msg.read }
+            msg_id: { $ref: "#/components/schemas/MsgId" }
+            by: { $ref: "#/components/schemas/Party" }
+
+    AlertNewEvent:
+      description: |
+        A new alert. Pushed at high priority so a locked phone rings. `voice_room`
+        is present on a critical alert when LiveKit is configured; the app asks
+        `POST /v1/alerts/{alert_id}/voice-token` for its join token.
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, alert_id, alert_type, title, message, priority, source, created_at]
+          properties:
+            type: { const: alert.new }
+            alert_id: { $ref: "#/components/schemas/AlertId" }
+            alert_type: { type: string }
+            title: { type: string }
+            message: { type: string }
+            priority: { $ref: "#/components/schemas/AlertPriority" }
+            source: { type: string }
+            voice_room: { type: string }
+            voice_url: { type: string }
+            data:
+              type: object
+              additionalProperties: true
+            created_at: { $ref: "#/components/schemas/Timestamp" }
+
+    AlertAckEvent:
+      description: An alert was acknowledged; every phone should stop its alarm.
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, alert_id, acked_at, acked_by]
+          properties:
+            type: { const: alert.ack }
+            alert_id: { $ref: "#/components/schemas/AlertId" }
+            acked_at: { $ref: "#/components/schemas/Timestamp" }
+            acked_by: { type: string, enum: [agent, user] }
+
+    AgentPresenceEvent:
+      description: Ephemeral (no seq). Sent to devices when the daemon connects/disconnects.
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, online]
+          properties:
+            type: { const: agent.presence }
+            online: { type: boolean }
+
+    WsHelloEvent:
+      description: Ephemeral (no seq). First frame of every WebSocket.
+      allOf:
+        - $ref: "#/components/schemas/EventBase"
+        - type: object
+          required: [type, relay_id, last_seq, server_ts]
+          properties:
+            type: { const: ws.hello }
+            relay_id: { $ref: "#/components/schemas/RelayId" }
+            last_seq: { type: integer, minimum: 0 }
+            server_ts: { $ref: "#/components/schemas/Timestamp" }
+
+    # ---------- push ----------
+    PushData:
+      description: |
+        The FCM `data` map (all values are strings). `event` is the compact JSON
+        of an `Event`; `sig` = base64url(HMAC-SHA256(push_secret, event)).
+      type: object
+      required: [v, relay_id, event, sig]
+      properties:
+        v: { const: "1" }
+        relay_id: { $ref: "#/components/schemas/RelayId" }
+        event: { type: string }
+        sig: { type: string }

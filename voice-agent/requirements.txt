@@ -1,0 +1,4 @@
+edge-tts>=6.1.10
+httpx>=0.27
+livekit>=1.0.0
+websockets>=13

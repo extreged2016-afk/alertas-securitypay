@@ -1,0 +1,20 @@
+package com.securitypay.alerts.push
+
+import android.util.Log
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import com.securitypay.alerts.Graph
+
+class SecurityPayMessagingService : FirebaseMessagingService() {
+    override fun onMessageReceived(message: RemoteMessage) {
+        // A high-priority message that arrives deprioritized can't start the call service.
+        if (message.priority != message.originalPriority) {
+            Log.w("SecurityPayFCM", "push deprioritized: original=${message.originalPriority} delivered=${message.priority}")
+        }
+        PushHandler.handle(applicationContext, message.data)
+    }
+
+    override fun onNewToken(token: String) {
+        Graph.push.onNewToken(token)
+    }
+}

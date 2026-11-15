@@ -1,0 +1,60 @@
+# Alert SecurityPay en Render (relay + agente de voz).
+#
+# 1. Sube este repositorio a GitHub.
+# 2. Render → New → Blueprint → elige el repositorio.
+# 3. Rellena las variables marcadas con `sync: false` (secretos) en el panel.
+#
+# El relay incluye el panel web/PWA en `/panel/` y guarda su estado (SQLite,
+# API key, eventos) en el disco `/data`: sin disco persistente se pierde al
+# reiniciar y los móviles tienen que emparejarse de nuevo.
+
+services:
+  - type: web
+    name: alert-securitypay-relay
+    runtime: docker
+    plan: starter
+    dockerContext: ./relay
+    dockerfilePath: ./relay/Dockerfile
+    healthCheckPath: /healthz
+    # SQLite y la API key viven aquí. Empareja siempre contra la misma instancia.
+    disk:
+      name: relay-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SECURITYPAY_DATA_DIR
+        value: /data
+      - key: SECURITYPAY_AGENT_NAME
+        value: Alert SecurityPay
+      # La URL pública sale de RENDER_EXTERNAL_URL. Si usas un dominio propio,
+      # define SECURITYPAY_PUBLIC_URL=https://alertas.midominio.com a mano.
+      # Firebase (FCM) para que las alertas suenen con la app cerrada.
+      # Pega el JSON completo de la cuenta de servicio, en una sola variable.
+      - key: FCM_SERVICE_ACCOUNT_JSON
+        sync: false
+      # LiveKit: sin esto las alertas funcionan, pero no hay voz.
+      # Puede ser LiveKit Cloud (wss). LIVEKIT_API_URL es la API administrativa.
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+  - type: worker
+    name: alert-securitypay-voice
+    runtime: docker
+    plan: starter
+    dockerContext: ./voice-agent
+    dockerfilePath: ./voice-agent/Dockerfile
+    envVars:
+      # URL pública del relay (la misma que abres en el navegador, con https://).
+      - key: SECURITYPAY_RELAY_URL
+        sync: false
+      # API key del relay: sale en el primer arranque en /data/api_key y en los logs.
+      - key: SECURITYPAY_API_KEY
+        sync: false
+      - key: SECURITYPAY_VOICE
+        value: es-ES-ElviraNeural

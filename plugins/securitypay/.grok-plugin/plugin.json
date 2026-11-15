@@ -1,0 +1,13 @@
+{
+  "name": "securitypay",
+  "version": "1.0.0",
+  "description": "Let Grok reach you on your Android phone through securitypay: send a message, wait for your reply, or ring the phone so a voice AI talks to you and returns the transcript. Uses the hosted securitypay MCP server with your API key.",
+  "author": {
+    "name": "securitypay",
+    "url": "https://securitypay.io"
+  },
+  "homepage": "https://securitypay.io",
+  "repository": "https://github.com/mutonby/securitypay",
+  "license": "Apache-2.0",
+  "keywords": ["securitypay", "securitypay call", "securitypay mcp"]
+}

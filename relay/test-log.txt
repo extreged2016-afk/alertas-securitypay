@@ -1,0 +1,26 @@
+﻿
+> @securitypay/relay@0.2.0 test
+> vitest run
+
+
+[1m[46m RUN [49m[22m [36mv3.2.7 [39m[90mH:/Alert Security Pay/AlertSecurityPay/relay[39m
+
+ [32mÔ£ô[39m test/config.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32mÔ£ô[39m test/quota.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32mÔ£ô[39m test/fcm.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 99[2mms[22m[39m
+ [32mÔ£ô[39m test/alerts.test.ts [2m([22m[2m6 tests[22m[2m)[22m[33m 476[2mms[22m[39m
+ [32mÔ£ô[39m test/relay.test.ts [2m([22m[2m17 tests[22m[2m)[22m[33m 561[2mms[22m[39m
+ [32mÔ£ô[39m test/calls.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 686[2mms[22m[39m
+ [32mÔ£ô[39m test/security.test.ts [2m([22m[2m12 tests[22m[2m)[22m[33m 697[2mms[22m[39m
+ [32mÔ£ô[39m test/hub.test.ts [2m([22m[2m20 tests[22m[2m)[22m[33m 7096[2mms[22m[39m
+   [33m[2mÔ£ô[22m[39m hub mode[2m > [22mcreates tenants whose base URL serves the normal relay API [33m 376[2mms[22m[39m
+   [33m[2mÔ£ô[22m[39m hub mode[2m > [22mrefuses calls without call minutes and ends an active call when they run out [33m 2429[2mms[22m[39m
+   [33m[2mÔ£ô[22m[39m hub mode[2m > [22mapplies a lowered call limit to the active call at once [33m 1199[2mms[22m[39m
+   [33m[2mÔ£ô[22m[39m hub mode[2m > [22mcloses an agent socket when its short-lived token expires [33m 1055[2mms[22m[39m
+   [33m[2mÔ£ô[22m[39m hub mode[2m > [22mlimits unanswered calls on a metered plan [33m 655[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m8 passed[39m[22m[90m (8)[39m
+[2m      Tests [22m [1m[32m76 passed[39m[22m[90m (76)[39m
+[2m   Start at [22m 11:55:34
+[2m   Duration [22m 8.17s[2m (transform 621ms, setup 0ms, collect 4.00s, tests 9.63s, environment 2ms, prepare 999ms)[22m
+

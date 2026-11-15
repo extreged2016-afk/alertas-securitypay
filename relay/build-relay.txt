@@ -1,0 +1,4 @@
+﻿
+> @securitypay/relay@0.2.0 build
+> tsc -p tsconfig.json
+

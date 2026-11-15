@@ -1,0 +1,19 @@
+{
+  "name": "Alert SecurityPay",
+  "short_name": "SecurityPay",
+  "description": "Centro de alertas ilimitado para tu infraestructura.",
+  "start_url": "/panel/",
+  "scope": "/panel/",
+  "display": "standalone",
+  "background_color": "#07111f",
+  "theme_color": "#07111f",
+  "lang": "es",
+  "icons": [
+    {
+      "src": "/panel/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

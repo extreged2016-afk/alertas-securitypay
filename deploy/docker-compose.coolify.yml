@@ -1,0 +1,105 @@
+# securitypay on a Coolify server (Traefik proxy, "coolify" network).
+#
+# Same hardening as docker-compose.proxy.yml; the difference is routing: Traefik
+# reaches the containers over the "coolify" network through the explicit labels
+# below (don't set domains for these services in Coolify, or it adds its own).
+#
+#   https://${SECURITYPAY_DOMAIN}/rtc*  -> livekit:7880 (signalling)
+#   https://${SECURITYPAY_DOMAIN}/*     -> relay:8080   (/twirp is never routed to LiveKit;
+#                                        the relay refuses its webhook when it comes via the proxy)
+#
+# Published on the host: LiveKit media only (UDP 50000-50100, TCP 7881).
+# Environment (nothing secret): SECURITYPAY_DOMAIN, LIVEKIT_NODE_IP, LIVEKIT_API_KEY,
+# SECURITYPAY_AGENT_NAME. Secrets: files prepared by deploy/prepare-host.sh.
+
+# Coolify runs compose with the repository root as project directory, so paths are
+# relative to the repo root. Locally: docker compose --project-directory . -f deploy/docker-compose.coolify.yml
+
+services:
+  relay:
+    build: ./relay
+    restart: unless-stopped
+    environment:
+      SECURITYPAY_PUBLIC_URL: https://${SECURITYPAY_DOMAIN:?set SECURITYPAY_DOMAIN}
+      SECURITYPAY_AGENT_NAME: ${SECURITYPAY_AGENT_NAME:-Agent}
+      FCM_SERVICE_ACCOUNT_FILE: /secrets/firebase-service-account.json
+      FCM_GOOGLE_SERVICES_FILE: /secrets/google-services.json
+      LIVEKIT_URL: wss://${SECURITYPAY_DOMAIN}
+      # An alias on the private network: the shared "coolify" network has other tenants' services on it.
+      LIVEKIT_API_URL: http://securitypay-livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET_FILE: /secrets/livekit-api-secret
+    volumes:
+      - relay-data:/data
+      - /opt/securitypay/relay:/secrets:ro
+    expose: ["8080"]
+    networks: [securitypay, coolify]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.securitypay-relay.rule=Host(`${SECURITYPAY_DOMAIN}`)
+      - traefik.http.routers.securitypay-relay.entrypoints=https
+      - traefik.http.routers.securitypay-relay.tls=true
+      - traefik.http.routers.securitypay-relay.tls.certresolver=letsencrypt
+      - traefik.http.routers.securitypay-relay.middlewares=securitypay-headers
+      - traefik.http.routers.securitypay-relay.service=securitypay-relay
+      - traefik.http.services.securitypay-relay.loadbalancer.server.port=8080
+      - traefik.http.middlewares.securitypay-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.securitypay-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.securitypay-headers.headers.frameDeny=true
+    # Probe every second while starting so the proxy routes to a new container within
+    # seconds of a deploy (the image's default waits 30 s for the first check).
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      start_interval: 1s
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 256
+
+  livekit:
+    # Pinned by digest (v1.13.10).
+    image: livekit/livekit-server:v1.13.10@sha256:89ca9ce0791e18d6e03bf6e2c49ceb27e1c754eae8bd50c989386c1a5963791a
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit/livekit.yaml", "--node-ip", "${LIVEKIT_NODE_IP:?set LIVEKIT_NODE_IP}"]
+    volumes:
+      - /opt/securitypay/livekit:/etc/livekit:ro
+    expose: ["7880"]
+    ports:
+      - "7881:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+    networks:
+      securitypay:
+        aliases: [securitypay-livekit]
+      coolify:
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.securitypay-rtc.rule=Host(`${SECURITYPAY_DOMAIN}`) && PathPrefix(`/rtc`)
+      - traefik.http.routers.securitypay-rtc.priority=100
+      - traefik.http.routers.securitypay-rtc.entrypoints=https
+      - traefik.http.routers.securitypay-rtc.tls=true
+      - traefik.http.routers.securitypay-rtc.tls.certresolver=letsencrypt
+      - traefik.http.routers.securitypay-rtc.service=securitypay-rtc
+      - traefik.http.services.securitypay-rtc.loadbalancer.server.port=7880
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 512
+
+networks:
+  securitypay:
+  coolify:
+    external: true
+
+volumes:
+  relay-data:

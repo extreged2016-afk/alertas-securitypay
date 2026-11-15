@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Actions are pinned by commit SHA (comment = release tag); bump them deliberately.
+permissions:
+  contents: read
+
+jobs:
+  relay-daemon:
+    name: Relay + daemon tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - name: Relay
+        working-directory: relay
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+          npm run build
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Daemon (unit + end-to-end against the relay build)
+        working-directory: daemon
+        run: uv run --extra voice pytest -q
+
+  deploy-smoke:
+    name: docker compose smoke test (Caddy TLS + relay + LiveKit + daemon)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: The other compose files parse
+        working-directory: deploy
+        run: |
+          docker compose -f docker-compose.local.yml --env-file .env.local.example config -q
+          SECURITYPAY_DOMAIN=relay.example.com LIVEKIT_NODE_IP=203.0.113.1 LIVEKIT_API_KEY=lk_x \
+            docker compose -f docker-compose.proxy.yml config -q
+      - name: Build and start
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          sed -i 's/^SECURITYPAY_DOMAIN=.*/SECURITYPAY_DOMAIN=localhost/' .env
+          # Skip STUN discovery: the runner's public IP doesn't matter here.
+          sed -i 's/^LIVEKIT_NODE_IP=.*/LIVEKIT_NODE_IP=127.0.0.1/' .env
+          docker compose up -d --build
+      - name: Relay answers over HTTPS and generated an API key
+        working-directory: deploy
+        run: |
+          for i in $(seq 1 60); do curl -skf https://localhost/healthz && break; sleep 2; done
+          curl -skf https://localhost/healthz | grep -q '"ok":true'
+          KEY=$(docker compose exec -T relay cat /data/api_key | tr -d '\r\n')
+          test -n "$KEY"
+          curl -skf -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{}' \
+            https://localhost/v1/pairing-tokens | tee /dev/stderr | grep -q '"relay_url\\":\\"https://localhost'
+          # Restart keeps the same identity and key.
+          docker compose restart relay
+          for i in $(seq 1 30); do curl -skf https://localhost/healthz && break; sleep 2; done
+          curl -skf -H "Authorization: Bearer $KEY" https://localhost/v1/status | grep -q relay_id
+      - name: LiveKit behind Caddy, sharing the generated secret with the relay
+        working-directory: deploy
+        run: |
+          test "$(docker compose ps -a --format '{{.State}} {{.ExitCode}}' livekit-init)" = "exited 0"
+          # /rtc reaches LiveKit (it rejects a bad token); its admin API and the webhook are not public.
+          for i in $(seq 1 30); do
+            [ "$(curl -sk -o /dev/null -w '%{http_code}' 'https://localhost/rtc/validate?access_token=x')" = 401 ] && break; sleep 2
+          done
+          test "$(curl -sk -o /dev/null -w '%{http_code}' 'https://localhost/rtc/validate?access_token=x')" = 401
+          test "$(curl -sk -o /dev/null -w '%{http_code}' -X POST https://localhost/twirp/livekit.RoomService/ListRooms)" = 404
+          test "$(curl -sk -o /dev/null -w '%{http_code}' -X POST https://localhost/v1/livekit/webhook)" = 404
+          # A token minted with the relay's secret is accepted by LiveKit, and a room created
+          # through LiveKit's internal API sends a webhook the relay verifies (200).
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TOKEN=$(docker compose exec -T relay node -e '
+            const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
+            const secret = require("fs").readFileSync(process.env.LIVEKIT_API_SECRET_FILE, "utf8").trim();
+            const key = process.env.LIVEKIT_API_KEY;
+            (async () => {
+              const rooms = new RoomServiceClient(process.env.LIVEKIT_API_URL, key, secret);
+              await rooms.createRoom({ name: "ci-smoke" });
+              const t = new AccessToken(key, secret, { identity: "ci" });
+              t.addGrant({ roomJoin: true, room: "ci-smoke" });
+              console.log(await t.toJwt());
+            })().catch((e) => { console.error(e); process.exit(1); });' | tr -d '\r')
+          curl -skf "https://localhost/rtc/validate?access_token=$TOKEN"
+          # The room is gone once closed: rooms are only created by the relay (auto_create: false).
+          docker compose exec -T relay node -e '
+            const { RoomServiceClient } = require("livekit-server-sdk");
+            const secret = require("fs").readFileSync(process.env.LIVEKIT_API_SECRET_FILE, "utf8").trim();
+            new RoomServiceClient(process.env.LIVEKIT_API_URL, process.env.LIVEKIT_API_KEY, secret)
+              .deleteRoom("ci-smoke").catch((e) => { console.error(e); process.exit(1); });'
+          test "$(curl -sk -o /dev/null -w '%{http_code}' "https://localhost/rtc/validate?access_token=$TOKEN")" = 404
+          sleep 3
+          docker compose logs --no-color --since "$SINCE" relay > "$RUNNER_TEMP/relay-webhook.log"
+          ids=$(grep '"url":"/v1/livekit/webhook"' "$RUNNER_TEMP/relay-webhook.log" | grep -o '"reqId":"[^"]*"' | sort -u)
+          test -n "$ids"
+          for id in $ids; do grep -F "$id" "$RUNNER_TEMP/relay-webhook.log" | grep -q '"statusCode":200'; done
+      - name: Optional daemon profile connects to the relay
+        working-directory: deploy
+        run: |
+          KEY=$(docker compose exec -T relay cat /data/api_key | tr -d '\r\n')
+          docker compose run --rm --build daemon init --relay http://relay:8080 --api-key "$KEY"
+          docker compose --profile daemon up -d daemon
+          for i in $(seq 1 30); do docker compose logs daemon | grep -q "connected to relay" && break; sleep 1; done
+          docker compose logs daemon | grep -q "connected to relay"
+          curl -skf -H "Authorization: Bearer $KEY" https://localhost/v1/status | tee /dev/stderr | grep -q '"agent_online":true'
+      - name: Logs
+        if: always()
+        working-directory: deploy
+        run: docker compose --profile daemon logs --no-color
