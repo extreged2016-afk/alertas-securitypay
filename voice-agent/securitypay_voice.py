@@ -19,10 +19,14 @@ import shutil
 import tempfile
 import urllib.parse
 
-import edge_tts
-import httpx
-import websockets
-from livekit import rtc
+try:
+    import edge_tts
+    import httpx
+    import websockets
+    from livekit import rtc
+except Exception as err:  # noqa: BLE001
+    print(f"[voice-agent] dependencia faltante: {err}", flush=True)
+    raise
 
 RELAY_URL = os.environ.get("SECURITYPAY_RELAY_URL", "http://relay:8080").rstrip("/")
 API_KEY = os.environ.get("SECURITYPAY_API_KEY", "").strip()
@@ -124,12 +128,7 @@ async def announce(alert: dict, info: dict) -> None:
             if alert_id not in _rooms:
                 return  # confirmada o sustituida mientras hablaba
             chunk = pcm[start : start + BYTES_PER_FRAME]
-            frame = rtc.AudioFrame(
-                data=chunk,
-                sample_rate=SAMPLE_RATE,
-                num_channels=CHANNELS,
-                samples_per_channel=SAMPLES_PER_FRAME,
-            )
+            frame = rtc.AudioFrame(chunk, SAMPLE_RATE, CHANNELS, SAMPLES_PER_FRAME)
             await source.capture_frame(frame)
 
         # Deja la sala unos segundos abiertos: si el móvil entra tarde, aún oye algo.
@@ -159,7 +158,7 @@ async def handle_alert(alert: dict) -> None:
 
 async def run_once() -> None:
     log(f"conectando a {RELAY_URL}")
-    async with websockets.connect(ws_url(), ping_interval=20, ping_timeout=60, max_size=4 * 1024 * 1024) as ws:
+    async with websockets.connect(ws_url(), ping_interval=20, ping_timeout=60) as ws:
         log("conectado al relay")
         async for raw in ws:
             try:
@@ -181,8 +180,9 @@ async def run_once() -> None:
 
 
 async def main() -> None:
+    log(f"relay={RELAY_URL} voz={VOICE} api_key={'definida' if API_KEY else 'FALTANTE'}")
     if not API_KEY:
-        raise SystemExit("SECURITYPAY_API_KEY no está definida")
+        raise SystemExit("SECURITYPAY_API_KEY no está definida (configúrala en el worker de Render)")
     delay = 1.0
     while True:
         try:

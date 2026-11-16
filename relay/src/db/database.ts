@@ -307,7 +307,11 @@ async function runPgMigrations(pool: any, migrations: string[]): Promise<void> {
 }
 
 export async function openDatabase(path: string, migrations: string[] = SQLITE_MIGRATIONS): Promise<Db> {
-  const url = process.env.DATABASE_URL || process.env.SECURITYPAY_DATABASE_URL;
+  const url =
+    process.env.DATABASE_URL ||
+    process.env.SECURITYPAY_DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.SUPABASE_DB_URL;
   if (url) {
     const pg = await import("pg");
     const pool = new (pg as any).Pool({ connectionString: url });
