@@ -59,7 +59,7 @@ export class Registry {
   }
 
   async byApiKey(apiKey: string): Promise<TenantRecord | undefined> {
-    const r = this.db
+    const r = await this.db
       .prepare("SELECT * FROM tenants WHERE api_key_hash = ?")
       .get(sha256(apiKey).toString("hex")) as unknown as Row | undefined;
     return r && fromRow(r);

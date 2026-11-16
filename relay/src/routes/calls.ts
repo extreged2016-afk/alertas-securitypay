@@ -627,7 +627,7 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
         ...(p.kind === "device" ? ["(device_ids IS NULL OR EXISTS (SELECT 1 FROM json_each(calls.device_ids) WHERE value = ?))"] : []),
       ];
       const args = [...(before ? [before] : []), ...(p.kind === "device" ? [p.deviceId] : []), limit];
-      const rows = ctx.db
+      const rows = await ctx.db
         .prepare(`SELECT * FROM calls ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY call_id DESC LIMIT ?`)
         .all(...args) as unknown as CallRow[];
       return { calls: rows.map(callFromRow) };

@@ -33,7 +33,7 @@ if (process.env.SECURITYPAY_HUB === "1") {
   shutdownOn(() => app.close(), app.log);
   await app.listen({ host: cfg.host, port: cfg.port });
   app.log.info(
-    { relay_id: ctx.relayId, public_url: cfg.publicUrl, push: ctx.pushProviderName },
+    { relay_id: ctx.relayId, public_url: cfg.publicUrl, push: ctx.pushProviderName, database: ctx.db.dialect },
     "securitypay relay ready",
   );
 }

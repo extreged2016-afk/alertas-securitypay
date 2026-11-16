@@ -127,7 +127,7 @@ export function messageRoutes(app: FastifyInstance, ctx: Ctx): void {
         where.push("sender = ?");
         args.push(from);
       }
-      const rows = db
+      const rows = await db
         .prepare(
           `SELECT * FROM messages ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY msg_id LIMIT ?`,
         )
