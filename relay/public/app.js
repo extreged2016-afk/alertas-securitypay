@@ -11,6 +11,9 @@ const state = {
   ws: null,
   wsAttempts: 0,
   wsTimer: null,
+  lastSeq: 0,
+  helloSeq: 0,
+  initialSyncDone: false,
   sound: false,
   notify: false,
   audioCtx: null,
@@ -84,20 +87,63 @@ async function login() {
   showApp();
 }
 
+function readHashAuth() {
+  if (!location.hash || location.hash.length <= 1) return null;
+  const params = new URLSearchParams(location.hash.slice(1));
+  const token = (params.get("token") || "").trim();
+  const server = (params.get("server") || "").trim().replace(/\/+$/, "");
+  if (!token) return null;
+  // Clear the token from the address bar and history immediately.
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch {}
+  return { token, server: /^https?:\/\//.test(server) ? server : "" };
+}
+
+function buildAccessLink() {
+  const base = `${location.origin}${location.pathname}`;
+  const params = new URLSearchParams();
+  params.set("token", state.token);
+  const currentOrigin = location.origin.replace(/\/+$/, "");
+  if (state.server && state.server.replace(/\/+$/, "") !== currentOrigin) {
+    params.set("server", state.server.replace(/\/+$/, ""));
+  }
+  return `${base}#${params.toString()}`;
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  ta.remove();
+}
+
 function showApp() {
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   updateSnippet();
-  refreshAll();
-  connectWs();
+  refreshAll().finally(() => connectWs());
 }
 
 function logout() {
   stopSiren();
+  clearTimeout(state.wsTimer);
   if (state.ws) { state.ws.onclose = null; state.ws.close(); state.ws = null; }
   if (state.livekitRoom) { try { state.livekitRoom.disconnect(); } catch {} state.livekitRoom = null; }
   localStorage.removeItem("securitypay.token");
   state.token = "";
+  state.lastSeq = 0;
+  state.helloSeq = 0;
+  state.initialSyncDone = false;
   $("app").classList.add("hidden");
   $("login").classList.remove("hidden");
 }
@@ -152,7 +198,7 @@ function connectWs() {
   clearTimeout(state.wsTimer);
   setWsState("connecting");
   let ws;
-  try { ws = new WebSocket(wsUrl(0)); } catch (e) { scheduleReconnect(); return; }
+  try { ws = new WebSocket(wsUrl(state.lastSeq)); } catch (e) { scheduleReconnect(); return; }
   state.ws = ws;
   ws.onopen = () => {
     state.wsAttempts = 0;
@@ -188,6 +234,18 @@ function setWsState(kind) {
 
 function handleEvent(evt) {
   if (!evt || !evt.type) return;
+  if (evt.type === "ws.hello") {
+    const serverSeq = Number(evt.last_seq || 0);
+    if (!state.initialSyncDone) {
+      state.helloSeq = serverSeq;
+      state.initialSyncDone = true;
+    }
+    return;
+  }
+  const isReplay = typeof evt.seq === "number" && evt.seq <= state.helloSeq;
+  if (typeof evt.seq === "number" && evt.seq > state.lastSeq) {
+    state.lastSeq = evt.seq;
+  }
   if (evt.type === "alert.new") {
     const alert = {
       alert_id: evt.alert_id,
@@ -200,9 +258,8 @@ function handleEvent(evt) {
       voice_room: evt.voice_room,
       voice_url: evt.voice_url,
       created_at: evt.created_at,
-      acked_at: null,
     };
-    upsertAlert(alert, true);
+    upsertAlert(alert, !isReplay);
   } else if (evt.type === "alert.ack") {
     const alert = state.alerts.get(evt.alert_id);
     if (alert) {
@@ -217,7 +274,10 @@ function handleEvent(evt) {
 
 function upsertAlert(alert, isNew) {
   const existing = state.alerts.get(alert.alert_id);
-  state.alerts.set(alert.alert_id, { ...existing, ...alert });
+  state.alerts.set(alert.alert_id, {
+    ...alert,
+    ...(existing?.acked_at ? { acked_at: existing.acked_at, acked_by: existing.acked_by } : {}),
+  });
   render();
   if (isNew && !existing) {
     if (alert.priority === "critical" || alert.priority === "high") {
@@ -450,18 +510,44 @@ async function sendTest() {
 
 /* ---------- boot ---------- */
 function boot() {
+  const hashAuth = readHashAuth();
+  if (hashAuth) {
+    if (hashAuth.server) state.server = hashAuth.server;
+    state.token = hashAuth.token;
+  }
   $("relay-url").value = state.server;
   if (state.token) {
     api("/v1/status").then((status) => {
       state.status = status;
+      localStorage.setItem("securitypay.server", state.server);
+      localStorage.setItem("securitypay.token", state.token);
       showApp();
-    }).catch(() => {
+    }).catch((e) => {
       $("relay-url").value = state.server;
+      if (hashAuth) {
+        state.token = "";
+        $("login-error").textContent =
+          e.status === 401
+            ? "La clave de API del enlace no es válida."
+            : `No se pudo conectar con el enlace: ${e.message}`;
+      }
     });
   }
   $("login-btn").addEventListener("click", login);
   $("api-key").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
   $("logout-btn").addEventListener("click", logout);
+  $("copy-access-link")?.addEventListener("click", async () => {
+    if (!state.token) return;
+    const btn = $("copy-access-link");
+    try {
+      await copyText(buildAccessLink());
+      const prev = btn.textContent;
+      btn.textContent = "¡Enlace copiado!";
+      setTimeout(() => { btn.textContent = prev; }, 2000);
+    } catch {
+      alert("No se pudo copiar el enlace al portapapeles.");
+    }
+  });
   $("refresh-btn").addEventListener("click", refreshAll);
   $("pair-btn").addEventListener("click", openPair);
   $("pair-close").addEventListener("click", () => $("pair-dialog").close());

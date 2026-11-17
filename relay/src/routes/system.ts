@@ -22,8 +22,8 @@ export function systemRoutes(app: FastifyInstance, ctx: Ctx): void {
       active_call: open && canSee(open, principal(req)) ? callFromRow(open) : null,
     };
     if (principal(req).kind === "agent") {
-      const row = await ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
-      body.device_count = row.n;
+      const row = (await ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get()) as { n: number };
+      body.device_count = Number(row.n);
     }
     return body;
   });

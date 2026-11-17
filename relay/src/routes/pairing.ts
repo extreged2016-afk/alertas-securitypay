@@ -68,7 +68,7 @@ export async function revokeDevice(ctx: Ctx, deviceId: string): Promise<void> {
     .prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?), fcm_token = NULL WHERE device_id = ?")
     .run(Date.now(), deviceId);
   ctx.hub.disconnectDevice(deviceId);
-  ctx.calls?.deviceRevoked(deviceId);
+  await ctx.calls?.deviceRevoked(deviceId);
 }
 
 export function pairingRoutes(app: FastifyInstance, ctx: Ctx): void {

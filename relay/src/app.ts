@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import staticFiles from "@fastify/static";
 import websocket from "@fastify/websocket";
@@ -74,15 +74,22 @@ async function resolveApiKey(cfg: Config, db: Db): Promise<{ apiKey: string; gen
   if (cfg.dataDir !== ":memory:") {
     const file = join(cfg.dataDir, "api_key");
     if (!existsSync(file)) {
-      writeFileSync(file, apiKey + "\n", { mode: 0o600 });
-      chmodSync(file, 0o600);
+      try {
+        mkdirSync(cfg.dataDir, { recursive: true });
+        writeFileSync(file, apiKey + "\n", { mode: 0o600 });
+        chmodSync(file, 0o600);
+      } catch (err) {
+        // When using Postgres, the key is already persisted in the meta table;
+        // a missing or read-only local disk must not stop the relay from booting.
+        if (db.dialect !== "postgres") throw err;
+      }
     }
   }
   return { apiKey, generated };
 }
 
 export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<BuiltApp> {
-  const db = await openDatabase(dbPath(cfg));
+  const db = await openDatabase(dbPath(cfg), undefined, { forceSqlite: Boolean(opts.tenant) });
   const relayId = await metaOrInit(db, "relay_id", () => newId("rly"));
   const jwtSecret = await metaOrInit(db, "jwt_secret", () => randomBytes(32).toString("base64url"));
   let apiKey = "";
@@ -133,7 +140,9 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
     const c = await calls.get(id);
     return c && { direction: c.direction, device_ids: targetsOf(c) };
   });
-  events.onEvent((e) => dispatcher.handle(e));
+  events.onEvent((e) => {
+    void dispatcher.handle(e).catch((err: unknown) => app.log.error({ err, event: e.type }, "push dispatch failed"));
+  });
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof ApiError) {
@@ -170,7 +179,7 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
   alertRoutes(app, ctx);
   messageRoutes(app, ctx);
   callRoutes(app, ctx, calls);
-  calls.resume();
+  await calls.resume();
   // Fetch the FCM access token now so the first call's push doesn't wait for it.
   void provider?.prepare?.().catch((err: unknown) => app.log.warn({ err }, "push provider warm-up failed"));
   wsRoutes(app, ctx);

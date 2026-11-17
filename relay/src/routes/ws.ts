@@ -186,7 +186,7 @@ export function wsRoutes(app: FastifyInstance, ctx: Ctx): void {
 
       const replay = async () => {
         send(
-          ephemeral({ type: "ws.hello", relay_id: ctx.relayId, last_seq: events.lastSeq(), server_ts: Date.now() } as Omit<
+          ephemeral({ type: "ws.hello", relay_id: ctx.relayId, last_seq: await events.lastSeq(), server_ts: Date.now() } as Omit<
             Event,
             "id" | "ts"
           >),

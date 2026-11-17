@@ -65,7 +65,7 @@ describe("pairing", () => {
   it("rejects expired tokens", async () => {
     const b = await app();
     const tok = (await b.app.inject({ method: "POST", url: "/v1/pairing-tokens", headers: AGENT, payload: { ttl_s: 30 } })).json();
-    b.ctx.db.prepare("UPDATE pairing_tokens SET expires_at = 0").run();
+    await b.ctx.db.prepare("UPDATE pairing_tokens SET expires_at = 0").run();
     const r = await b.app.inject({
       method: "POST",
       url: "/v1/pair",
@@ -194,7 +194,7 @@ describe("messages", () => {
     b.push.next = { ok: false, unregistered: true, error: "404 UNREGISTERED" };
     await b.app.inject({ method: "POST", url: "/v1/messages", headers: AGENT, payload: { text: "x" } });
     await new Promise((r) => setTimeout(r, 10));
-    const row = b.ctx.db.prepare("SELECT fcm_token FROM devices WHERE device_id = ?").get(d.device_id) as {
+    const row = (await b.ctx.db.prepare("SELECT fcm_token FROM devices WHERE device_id = ?").get(d.device_id)) as {
       fcm_token: string | null;
     };
     expect(row.fcm_token).toBeNull();

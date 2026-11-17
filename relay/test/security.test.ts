@@ -47,7 +47,7 @@ describe("call authorization", () => {
     expect((await post(b, url, other.headers)).statusCode).toBe(403);
     await post(b, `/v1/calls/${call.call_id}/accept`, AGENT);
     expect((await post(b, url, other.headers)).statusCode).toBe(403);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("active");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("active");
     expect((await post(b, url, a.headers)).json().state).toBe("ended");
   });
 
@@ -61,7 +61,7 @@ describe("call authorization", () => {
 
     await b.app.inject({ method: "DELETE", url: `/v1/devices/${a.device_id}`, headers: AGENT });
     await flush();
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("ended");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("ended");
     expect(b.livekit.deleted).toContain(call.call_id);
   });
 
@@ -72,26 +72,26 @@ describe("call authorization", () => {
     const { call } = (await post(b, "/v1/calls", AGENT, { reason: "x" })).json();
 
     await b.app.inject({ method: "DELETE", url: `/v1/devices/${a.device_id}`, headers: AGENT });
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("ringing");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("ringing");
     await b.app.inject({ method: "DELETE", url: `/v1/devices/${other.device_id}`, headers: AGENT });
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("canceled");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("canceled");
   });
 
   it("a failing ring timer is logged, not fatal, and the call still ends once the database recovers", async () => {
     const b = await app({ ringTimeoutS: 0.05 });
     await pairDevice(b);
     const { call } = (await post(b, "/v1/calls", AGENT, { reason: "x" })).json();
-    b.ctx.db.exec("CREATE TRIGGER no_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+    await b.ctx.db.exec("CREATE TRIGGER no_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END");
     await new Promise((r) => setTimeout(r, 100));
-    b.ctx.db.exec("DROP TRIGGER no_events");
-    expect(b.ctx.calls!.get(call.call_id)).toBeDefined();
+    await b.ctx.db.exec("DROP TRIGGER no_events");
+    expect(await b.ctx.calls!.get(call.call_id)).toBeDefined();
   });
 });
 
 describe("event log", () => {
   it("a failed event write leaves no row behind", async () => {
     const b = await app();
-    b.ctx.db.exec("CREATE TRIGGER no_body BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+    await b.ctx.db.exec("CREATE TRIGGER no_body BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'disk full'); END");
     const before = await b.ctx.events.lastSeq();
     await expect(b.ctx.events.emit({ type: "msg.read", msg_id: "m", by: "user" })).rejects.toThrow();
     expect(await b.ctx.events.lastSeq()).toBe(before);
@@ -99,7 +99,7 @@ describe("event log", () => {
 
   it("a bad stored row doesn't block the cursor", async () => {
     const b = await app();
-    b.ctx.db.prepare("INSERT INTO events (id, type, ts, body) VALUES ('evt_x', 'msg.new', 1, '')").run();
+    await b.ctx.db.prepare("INSERT INTO events (id, type, ts, body) VALUES ('evt_x', 'msg.new', 1, '')").run();
     await post(b, "/v1/messages", AGENT, { text: "after" });
     const page = await b.ctx.events.list(0, 500);
     expect(page.events.map((e) => e.type)).toEqual(["msg.new"]);

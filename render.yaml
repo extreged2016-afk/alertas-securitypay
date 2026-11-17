@@ -26,15 +26,28 @@ services:
         value: /data
       # Supabase (PostgreSQL). Si se define, el Relay usa Postgres en lugar de SQLite
       # y los dispositivos emparejados persisten aunque Render reinicie el servicio.
+      # IMPORTANTE en Render: usa la URI del Connection Pooler (IPv4), con usuario
+      # postgres.<project-ref>, ej.:
+      #   postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres
+      # Si la contraseña tiene caracteres especiales (@ # : / ? % &), puedes definirla
+      # aparte en DATABASE_PASSWORD para evitar problemas de URL-encoding.
       - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+      # Opcional: fija la API key (ak_...) por variable de entorno. Si se omite, se
+      # genera una sola vez y queda persistida en Postgres (tabla meta) y /data/api_key.
+      - key: SECURITYPAY_API_KEY
         sync: false
       - key: SECURITYPAY_AGENT_NAME
         value: Alert SecurityPay
       # La URL pública sale de RENDER_EXTERNAL_URL. Si usas un dominio propio,
       # define SECURITYPAY_PUBLIC_URL=https://alertas.midominio.com a mano.
       # Firebase (FCM) para que las alertas suenen con la app cerrada.
-      # Pega el JSON completo de la cuenta de servicio, en una sola variable.
+      # Pega el JSON completo de la cuenta de servicio y de google-services.json.
       - key: FCM_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: FCM_GOOGLE_SERVICES_JSON
         sync: false
       # LiveKit: sin esto las alertas funcionan, pero no hay voz.
       # Puede ser LiveKit Cloud (wss). LIVEKIT_API_URL es la API administrativa.

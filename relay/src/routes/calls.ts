@@ -114,10 +114,10 @@ export class Calls {
 
   /** After a restart: time out calls that expired while we were down and re-arm the others. */
   async resume(): Promise<void> {
-    const open = await this.ctx.db.prepare("SELECT * FROM calls WHERE state IN ('ringing','active')").all() as unknown as CallRow[];
+    const open = (await this.ctx.db.prepare("SELECT * FROM calls WHERE state IN ('ringing','active')").all()) as unknown as CallRow[];
     for (const c of open) {
       this.armTimer(c);
-      if (c.state === "active") this.armQuota(c.call_id);
+      if (c.state === "active") await this.armQuota(c.call_id);
     }
   }
 
@@ -142,13 +142,13 @@ export class Calls {
   }
 
   private async countParts(callId: string, ...states: PartState[]): Promise<number> {
-    const r = await this.ctx.db
+    const r = (await this.ctx.db
       .prepare(`SELECT COUNT(*) AS n FROM call_participants WHERE call_id = ? AND state IN (${states.map(() => "?").join(",")})`)
-      .get(callId, ...states) as { n: number };
-    return r.n;
+      .get(callId, ...states)) as { n: number };
+    return Number(r.n);
   }
 
-  async stop(): Promise<void> {
+  stop(): void {
     for (const t of [...this.timers.values(), ...this.quotaTimers.values()]) clearTimeout(t);
     this.timers.clear();
     this.quotaTimers.clear();
@@ -163,17 +163,18 @@ export class Calls {
     const left = await callMsLeft(this.ctx.db, this.ctx.limits());
     if (left === undefined || this.quotaTimers.has(callId)) return;
     if (left < 1000) {
-      this.finish(callId, "active", "ended", "relay", "quota");
+      await this.finish(callId, "active", "ended", "relay", "quota");
       return;
     }
     const t = setTimeout(() => {
       this.quotaTimers.delete(callId);
-      try {
-        void this.get(callId).then((c) => { if (c?.state === "active") this.armQuota(callId); });
-      } catch (err) {
+      void (async () => {
+        const c = await this.get(callId);
+        if (c?.state === "active") await this.armQuota(callId);
+      })().catch((err: unknown) => {
         // Timers run outside any request: an error here would end the whole process.
         this.ctx.log.error({ err, call: callId }, "call quota check failed");
-      }
+      });
     }, Math.min(left, QUOTA_CHECK_MS));
     t.unref();
     this.quotaTimers.set(callId, t);
@@ -186,7 +187,7 @@ export class Calls {
       this.quotaTimers.delete(id);
     }
     const c = await this.open();
-    if (c?.state === "active") this.armQuota(c.call_id);
+    if (c?.state === "active") await this.armQuota(c.call_id);
   }
 
   /** Whether a device may see this event; events of a targeted call only reach its phones. */
@@ -202,8 +203,8 @@ export class Calls {
     if (direction === "agent_to_user") {
       if (!body.reason) throw new ApiError(400, "invalid_request", "reason is required");
       if (body.device_ids !== undefined) targets = await this.validTargets(body.device_ids);
-      const n = await this.ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get() as { n: number };
-      if (n.n === 0) throw new ApiError(409, "no_devices", "No paired devices");
+      const n = (await this.ctx.db.prepare("SELECT COUNT(*) AS n FROM devices WHERE revoked_at IS NULL").get()) as { n: number };
+      if (Number(n.n) === 0) throw new ApiError(409, "no_devices", "No paired devices");
     } else if (body.device_ids !== undefined) {
       throw new ApiError(400, "invalid_request", "device_ids is only for calls placed by the agent");
     } else if (!this.ctx.hub.isAgentOnline()) {
@@ -239,12 +240,14 @@ export class Calls {
     if (direction === "agent_to_user") {
       const devs =
         targets ??
-        (await this.ctx.db.prepare("SELECT device_id FROM devices WHERE revoked_at IS NULL").all() as Array<{ device_id: string }>).map(
-          (d) => d.device_id,
-        );
-      for (const d of devs) this.setPart(row.call_id, d, "ringing");
+        (
+          (await this.ctx.db.prepare("SELECT device_id FROM devices WHERE revoked_at IS NULL").all()) as Array<{
+            device_id: string;
+          }>
+        ).map((d) => d.device_id);
+      for (const d of devs) await this.setPart(row.call_id, d, "ringing");
     } else if (p.kind === "device") {
-      this.setPart(row.call_id, p.deviceId, "joined");
+      await this.setPart(row.call_id, p.deviceId, "joined");
     }
     await this.ctx.events.emit({
       type: "call.invite",
@@ -308,7 +311,7 @@ export class Calls {
       .run(now, callId);
     if (res.changes !== 1) throw invalidState((await this.get(callId))!.state);
     this.settle(callId);
-    this.armQuota(callId);
+    await this.armQuota(callId);
     await this.ctx.events.emit({ type: "call.accept", call_id: callId, by: "agent" });
     return (await this.get(callId))!;
   }
@@ -330,7 +333,7 @@ export class Calls {
 
   /** A phone already on the call asks for a new token: no event, but its join time moves on. */
   private async rejoin(c: CallRow, deviceId: string): Promise<CallRow> {
-    this.setPart(c.call_id, deviceId, "joined");
+    await this.setPart(c.call_id, deviceId, "joined");
     return c;
   }
 
@@ -340,9 +343,9 @@ export class Calls {
       await this.ctx.db
         .prepare("UPDATE calls SET state = 'active', answered_at = ?, device_id = ? WHERE call_id = ? AND state = 'ringing'")
         .run(Date.now(), deviceId, c.call_id);
-      this.armQuota(c.call_id);
+      await this.armQuota(c.call_id);
     }
-    this.setPart(c.call_id, deviceId, "joined");
+    await this.setPart(c.call_id, deviceId, "joined");
     this.ringingDevices.get(c.call_id)?.delete(deviceId);
     await this.ctx.events.emit({ type: "call.accept", call_id: c.call_id, by: "user", device_id: deviceId });
     return (await this.get(c.call_id))!;
@@ -434,12 +437,12 @@ export class Calls {
     if (!c) return;
     const part = await this.part(c.call_id, deviceId);
     if (part === "joined") {
-      if (c.state === "ringing") void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
-      else void this.finish(c.call_id, "active", "ended", "relay", "room_closed");
+      if (c.state === "ringing") await this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+      else await this.finish(c.call_id, "active", "ended", "relay", "room_closed");
     } else if (part === "ringing") {
       await this.setPart(c.call_id, deviceId, "missed");
       if (c.state === "ringing" && (await this.countParts(c.call_id, "ringing", "joined")) === 0) {
-        void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+        await this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
       }
     }
   }
@@ -447,8 +450,8 @@ export class Calls {
   /** Ends whatever call is open, e.g. when the tenant is disabled or deleted. */
   async terminateOpen(): Promise<void> {
     const c = await this.open();
-    if (c?.state === "ringing") void this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
-    else if (c?.state === "active") void this.finish(c.call_id, "active", "ended", "relay", "room_closed");
+    if (c?.state === "ringing") await this.finish(c.call_id, "ringing", "canceled", "relay", "canceled");
+    else if (c?.state === "active") await this.finish(c.call_id, "active", "ended", "relay", "room_closed");
   }
 
   private async leave(callId: string, deviceId: string, by: Schemas["Actor"], reason: Schemas["EndReason"]): Promise<CallRow> {
@@ -496,15 +499,13 @@ export class Calls {
     return c;
   }
 
-  private async armTimer(c: CallRow, delayMs = Math.max(0, c.expires_at - Date.now())): Promise<void> {
+  private armTimer(c: CallRow, delayMs = Math.max(0, c.expires_at - Date.now())): void {
     const t = setTimeout(() => {
-      try {
-        this.timeout(c.call_id);
-      } catch (err) {
+      void this.timeout(c.call_id).catch((err: unknown) => {
         // Timers run outside any request: an error here would end the whole process.
         this.ctx.log.error({ err, call: c.call_id }, "call timer failed");
         this.armTimer(c, TIMER_RETRY_MS);
-      }
+      });
     }, delayMs);
     t.unref();
     this.timers.set(c.call_id, t);
@@ -521,7 +522,7 @@ export class Calls {
     if (c?.state === "active") {
       // Everyone who answered already left while others could still join.
       if (c.direction === "agent_to_user" && (await this.countParts(callId, "joined")) === 0) {
-        this.finish(callId, "active", "ended", "relay", "hangup");
+        await this.finish(callId, "active", "ended", "relay", "hangup");
       }
       return;
     }
@@ -534,16 +535,16 @@ export class Calls {
   }
 
   /** The call left `ringing`: stop the timer. */
-  private async settle(callId: string): Promise<void> {
+  private settle(callId: string): void {
     clearTimeout(this.timers.get(callId));
     this.timers.delete(callId);
     this.ringingDevices.delete(callId);
   }
 
-  private async closeRoom(callId: string): Promise<void> {
+  private closeRoom(callId: string): void {
     const lk = this.ctx.livekit;
     if (!lk) return;
-    lk.deleteRoom(roomName(this.ctx, callId)).catch(() => undefined);
+    void lk.deleteRoom(roomName(this.ctx, callId)).catch(() => undefined);
   }
 }
 
@@ -621,10 +622,14 @@ export function callRoutes(app: FastifyInstance, ctx: Ctx, calls: Calls): void {
     async (req) => {
       const { limit = 100, before } = req.query;
       const p = principal(req);
+      const deviceFilter =
+        ctx.db.dialect === "postgres"
+          ? "(device_ids IS NULL OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(calls.device_ids::jsonb) AS v WHERE v = ?))"
+          : "(device_ids IS NULL OR EXISTS (SELECT 1 FROM json_each(calls.device_ids) WHERE value = ?))";
       // Devices don't see targeted calls that are not for them.
       const where = [
         ...(before ? ["call_id < ?"] : []),
-        ...(p.kind === "device" ? ["(device_ids IS NULL OR EXISTS (SELECT 1 FROM json_each(calls.device_ids) WHERE value = ?))"] : []),
+        ...(p.kind === "device" ? [deviceFilter] : []),
       ];
       const args = [...(before ? [before] : []), ...(p.kind === "device" ? [p.deviceId] : []), limit];
       const rows = await ctx.db
