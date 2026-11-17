@@ -6,14 +6,15 @@ const NOV = Date.UTC(2026, 10, 1); // 2026-11-01T00:00Z
 
 async function dbWith(calls: Array<[answered: number, ended: number | null]>) {
   const db = await openDatabase(":memory:");
-  calls.forEach(([a, e], i) =>
-    db
+  for (let i = 0; i < calls.length; i++) {
+    const [a, e] = calls[i]!;
+    await db
       .prepare(
         `INSERT INTO calls (call_id, direction, state, priority, agent_name, created_at, expires_at, answered_at, ended_at)
          VALUES (?, 'agent_to_user', ?, 'normal', 'A', ?, ?, ?, ?)`,
       )
-      .run(`call_${i}`, e === null ? "active" : "ended", a, a + 30_000, a, e),
-  );
+      .run(`call_${i}`, e === null ? "active" : "ended", a, a + 30_000, a, e);
+  }
   return db;
 }
 
@@ -38,4 +39,3 @@ describe("call quota accounting", () => {
     expect(await callMsLeft(await dbWith([]), { max_devices: null, call_seconds_per_month: null, messages_per_day: null })).toBeUndefined();
   });
 });
-PYEOF

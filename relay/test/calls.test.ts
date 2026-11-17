@@ -118,7 +118,7 @@ describe("calls", () => {
       headers: { authorization: "ok", "content-type": "application/webhook+json" },
       payload: JSON.stringify({ event: "participant_left", room: { name: call.call_id }, participant: { identity: `device_${c.device_id}` } }),
     });
-    expect(b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", ended_by: "relay", end_reason: "room_closed" });
+    expect(await b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", ended_by: "relay", end_reason: "room_closed" });
     expect(b.livekit.deleted).toEqual([call.call_id]);
     const types = (await eventsOf(b)).map((e) => e.type);
     expect(types).toEqual(["call.invite", "call.decline", "call.accept", "call.accept", "call.end"]);
@@ -131,7 +131,7 @@ describe("calls", () => {
     const c = await pairDevice(b, "B", "fcm-tok-2");
     const first = (await placeCall(b)).json().call;
     await b.app.inject({ method: "POST", url: `/v1/calls/${first.call_id}/accept`, headers: a.headers });
-    vi.advanceTimersByTime(31_000);
+    await vi.advanceTimersByTimeAsync(31_000);
     // B's ring window is over
     const late = await b.app.inject({ method: "POST", url: `/v1/calls/${first.call_id}/accept`, headers: c.headers });
     expect(late.statusCode).toBe(409);
@@ -142,7 +142,7 @@ describe("calls", () => {
 
     const second = (await placeCall(b)).json().call;
     await b.app.inject({ method: "POST", url: `/v1/calls/${second.call_id}/decline`, headers: a.headers });
-    expect(b.ctx.calls!.get(second.call_id)!.state).toBe("ringing");
+    expect((await b.ctx.calls!.get(second.call_id))!.state).toBe("ringing");
     const r = await b.app.inject({ method: "POST", url: `/v1/calls/${second.call_id}/decline`, headers: c.headers });
     expect(r.json().state).toBe("declined");
     expect(b.livekit.deleted).toContain(second.call_id);
@@ -161,8 +161,8 @@ describe("calls", () => {
     // C declines, A answers, B lets it ring out
     await post(d.headers, "decline");
     await post(a.headers, "accept");
-    vi.advanceTimersByTime(31_000);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("active");
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("active");
     // accept is only for ringing phones; join works at any time while active
     expect((await post(c.headers, "accept")).json().error.code).toBe("invalid_state");
     b.push.sent = [];
@@ -239,10 +239,10 @@ describe("calls", () => {
         }),
       });
     await left(t0 + 500);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("active");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("active");
     // the new session leaving is a real leave: last phone gone after the ring window
     await left(Date.now() + 300);
-    expect(b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", end_reason: "room_closed" });
+    expect(await b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", end_reason: "room_closed" });
   });
 
   it("rings out to missed after the timeout and survives a restart", async () => {
@@ -250,10 +250,10 @@ describe("calls", () => {
     const b = await app({ ringTimeoutS: 5 });
     await pairDevice(b);
     const { call } = (await placeCall(b)).json();
-    vi.advanceTimersByTime(4_000);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("ringing");
-    vi.advanceTimersByTime(1_500);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("missed");
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("ringing");
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("missed");
     expect((await eventsOf(b)).at(-1)).toMatchObject({ type: "call.missed", call_id: call.call_id });
     expect(b.livekit.deleted).toEqual([call.call_id]);
     // A new call can be placed now.
@@ -322,13 +322,13 @@ describe("calls", () => {
       payload: JSON.stringify({ event: "room_finished", room: { name: call.call_id } }),
     });
     expect(proxied.statusCode).toBe(404);
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("active");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("active");
     // someone else leaving doesn't end it
     await hook("ok", { event: "participant_left", room: { name: call.call_id }, participant: { identity: "observer" } });
-    expect(b.ctx.calls!.get(call.call_id)!.state).toBe("active");
+    expect((await b.ctx.calls!.get(call.call_id))!.state).toBe("active");
     const r = await hook("ok", { event: "participant_left", room: { name: call.call_id }, participant: { identity: `device_${dev.device_id}` } });
     expect(r.statusCode).toBe(200);
-    expect(b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", ended_by: "relay", end_reason: "room_closed" });
+    expect(await b.ctx.calls!.get(call.call_id)).toMatchObject({ state: "ended", ended_by: "relay", end_reason: "room_closed" });
   });
 
   describe("targeted calls (device_ids)", () => {

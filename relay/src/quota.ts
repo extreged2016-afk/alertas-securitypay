@@ -39,12 +39,13 @@ export function dayStart(now = Date.now()): number {
  */
 export async function callMsThisMonth(db: Db, now = Date.now()): Promise<number> {
   const start = monthStart(now);
-  const r = await db
-    .prepare(
-      `SELECT COALESCE(SUM(MAX(0, MIN(COALESCE(ended_at, ?), ?) - MAX(answered_at, ?))), 0) AS ms
-       FROM calls WHERE answered_at IS NOT NULL AND COALESCE(ended_at, ?) > ?`,
-    )
-    .get(now, now, start, now, start) as { ms: number };
+  const sql =
+    db.dialect === "postgres"
+      ? `SELECT COALESCE(SUM(GREATEST(0, LEAST(COALESCE(ended_at, CAST(? AS BIGINT)), CAST(? AS BIGINT)) - GREATEST(answered_at, CAST(? AS BIGINT)))), 0) AS ms
+         FROM calls WHERE answered_at IS NOT NULL AND COALESCE(ended_at, CAST(? AS BIGINT)) > CAST(? AS BIGINT)`
+      : `SELECT COALESCE(SUM(MAX(0, MIN(COALESCE(ended_at, ?), ?) - MAX(answered_at, ?))), 0) AS ms
+         FROM calls WHERE answered_at IS NOT NULL AND COALESCE(ended_at, ?) > ?`;
+  const r = (await db.prepare(sql).get(now, now, start, now, start)) as { ms: number };
   return Number(r.ms);
 }
 

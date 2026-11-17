@@ -40,23 +40,24 @@ export class EventLog {
     if (!EPHEMERAL_TYPES.has(event.type)) {
       // The body holds the seq, so it takes two statements; they commit or fail together:
       // an empty row left behind would be replayed to every client.
-      await this.db.exec("SAVEPOINT emit");
-      try {
-        const res = await this.db
-          .prepare("INSERT INTO events (id, type, ts, body) VALUES (?, ?, ?, ?)")
-          .run(event.id, event.type, event.ts, "");
-        event.seq = Number(res.lastInsertRowid ?? 0);
-        if (!event.seq) {
-          const r = await this.db.prepare("SELECT seq FROM events WHERE id = ?").get(event.id) as { seq: number };
-          event.seq = r.seq;
+      await this.db.transaction(async (tx) => {
+        if (tx.dialect === "postgres") {
+          const r = (await tx
+            .prepare("INSERT INTO events (id, type, ts, body) VALUES (?, ?, ?, ?) RETURNING seq")
+            .get(event.id, event.type, event.ts, "")) as { seq: number };
+          event.seq = Number(r.seq);
+        } else {
+          const res = await tx
+            .prepare("INSERT INTO events (id, type, ts, body) VALUES (?, ?, ?, ?)")
+            .run(event.id, event.type, event.ts, "");
+          event.seq = Number(res.lastInsertRowid ?? 0);
+          if (!event.seq) {
+            const r = (await tx.prepare("SELECT seq FROM events WHERE id = ?").get(event.id)) as { seq: number };
+            event.seq = Number(r.seq);
+          }
         }
-        await this.db.prepare("UPDATE events SET body = ? WHERE seq = ?").run(JSON.stringify(event), event.seq);
-        await this.db.exec("RELEASE emit");
-      } catch (err) {
-        await this.db.exec("ROLLBACK TO emit");
-        await this.db.exec("RELEASE emit");
-        throw err;
-      }
+        await tx.prepare("UPDATE events SET body = ? WHERE seq = ?").run(JSON.stringify(event), event.seq);
+      });
     }
     for (const s of this.subscribers) {
       if ((audience === "all" || (audience === "agent") === (s.principal.kind === "agent")) && (await this.visible(event, s.principal))) {
@@ -107,8 +108,8 @@ export class EventLog {
   }
 
   async lastSeq(): Promise<number> {
-    const row = await this.db.prepare("SELECT MAX(seq) AS s FROM events").get() as { s: number | null };
-    return row.s ?? 0;
+    const row = (await this.db.prepare("SELECT MAX(seq) AS s FROM events").get()) as { s: number | null };
+    return Number(row?.s ?? 0);
   }
 
   subscribe(sub: Subscriber): () => void {

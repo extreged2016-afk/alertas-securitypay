@@ -1,6 +1,8 @@
+import { setDefaultResultOrder } from "node:dns";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { Pool, PoolClient, PoolConfig } from "pg";
 
 const SQLITE_MIGRATIONS: string[] = [
   `
@@ -192,20 +194,29 @@ const PG_MIGRATIONS: string[] = [
 
 export const MIGRATIONS = SQLITE_MIGRATIONS;
 
+/** Advisory lock key for serializing concurrent Postgres schema migrations (e.g. rolling deploys). */
+const PG_MIGRATION_LOCK_KEY = 739182645;
+
 export type Db = {
   dialect: "sqlite" | "postgres";
   prepare(sql: string): Statement;
   exec(sql: string): Promise<void>;
+  transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T>;
   close(): Promise<void>;
 };
 
 export interface Statement {
   get(...params: unknown[]): Promise<unknown>;
   all(...params: unknown[]): Promise<unknown[]>;
-  run(...params: unknown[]): Promise<{ changes: number; lastInsertRowid?: number | bigint }>;
+  run(...params: unknown[]): Promise<RunResult>;
 }
 
 export type RunResult = { changes: number; lastInsertRowid?: number | bigint };
+
+export interface OpenDatabaseOptions {
+  /** Always open SQLite even if DATABASE_URL is set (used for in-memory tests and isolated hub tenants). */
+  forceSqlite?: boolean;
+}
 
 // ---------- SQLite (sync, wrapped async) ----------
 
@@ -233,8 +244,12 @@ export function openSqliteDatabase(path: string, migrations: string[] = SQLITE_M
 
 class SqliteStatement implements Statement {
   constructor(private stmt: ReturnType<DatabaseSync["prepare"]>) {}
-  async get(...params: any[]) { return this.stmt.get(...params); }
-  async all(...params: any[]) { return this.stmt.all(...params) as unknown[]; }
+  async get(...params: any[]) {
+    return this.stmt.get(...params);
+  }
+  async all(...params: any[]) {
+    return this.stmt.all(...params) as unknown[];
+  }
   async run(...params: any[]) {
     const r = this.stmt.run(...params) as { changes: number; lastInsertRowid: number | bigint };
     return { changes: r.changes ?? 0, lastInsertRowid: r.lastInsertRowid };
@@ -243,100 +258,406 @@ class SqliteStatement implements Statement {
 
 class SqliteDb implements Db {
   dialect = "sqlite" as const;
+  private spSeq = 0;
+
   constructor(private db: DatabaseSync) {}
-  prepare(sql: string): Statement { return new SqliteStatement(this.db.prepare(sql)); }
-  async exec(sql: string): Promise<void> { this.db.exec(sql); }
-  async close(): Promise<void> { this.db.close(); }
+  prepare(sql: string): Statement {
+    return new SqliteStatement(this.db.prepare(sql));
+  }
+  async exec(sql: string): Promise<void> {
+    this.db.exec(sql);
+  }
+  async transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
+    const sp = `sp_${++this.spSeq}`;
+    this.db.exec(`SAVEPOINT ${sp}`);
+    try {
+      const result = await fn(this);
+      this.db.exec(`RELEASE ${sp}`);
+      return result;
+    } catch (err) {
+      this.db.exec(`ROLLBACK TO ${sp}`);
+      this.db.exec(`RELEASE ${sp}`);
+      throw err;
+    }
+  }
+  async close(): Promise<void> {
+    this.db.close();
+  }
 }
 
 // ---------- Postgres ----------
 
-function toPg(sql: string): string {
+export function toPg(sql: string): string {
   let out = "";
   let i = 1;
   let inSingle = false;
   for (let c = 0; c < sql.length; c++) {
     const ch = sql[c];
-    if (ch === "'") { inSingle = !inSingle; out += ch; }
-    else if (!inSingle && ch === "?") { out += `$${i++}`; }
-    else out += ch;
+    if (ch === "'") {
+      inSingle = !inSingle;
+      out += ch;
+    } else if (!inSingle && ch === "?") {
+      out += `$${i++}`;
+    } else {
+      out += ch;
+    }
   }
   return out;
 }
 
+export interface PgConnectionMeta {
+  host: string;
+  port: number;
+  database: string;
+  user?: string;
+  sslEnabled: boolean;
+  passwordLooksBracketed: boolean;
+  passwordLooksPlaceholder: boolean;
+  isSupabasePooler: boolean;
+  isSupabaseDirect: boolean;
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Parses a PostgreSQL connection URL into an explicit `PoolConfig` without
+ * delegating SSL to `pg-connection-string` (which ignores `PoolConfig.ssl` when
+ * `connectionString` is present and treats `sslmode=require` as strict CA check,
+ * breaking Supabase's connection pooler).
+ */
+export function parsePgConnectionConfig(
+  rawUrl: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { config: PoolConfig; meta: PgConnectionMeta } {
+  let cleaned = rawUrl.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  if (!/^postgres(?:ql)?:\/\//i.test(cleaned)) {
+    throw new Error("DATABASE_URL must start with postgresql:// or postgres://");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    throw new Error(
+      "DATABASE_URL is not a valid PostgreSQL URL. If your password has special characters (#, ?, /, %, @), URL-encode them or set DATABASE_PASSWORD separately.",
+    );
+  }
+
+  const host = parsed.hostname.replace(/^\[(.+)\]$/, "$1");
+  if (!host) {
+    throw new Error(
+      "DATABASE_URL is missing a hostname. If your password contains '#' or '?', URL-encode it or set DATABASE_PASSWORD separately.",
+    );
+  }
+  const port = parsed.port ? Number(parsed.port) : 5432;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error(`DATABASE_URL has an invalid port: ${parsed.port}`);
+  }
+  const database = safeDecode(parsed.pathname.replace(/^\//, "")) || "postgres";
+  const user = parsed.username ? safeDecode(parsed.username) : undefined;
+  const urlPassword = parsed.password !== "" ? safeDecode(parsed.password) : undefined;
+  const envPassword = env.DATABASE_PASSWORD && env.DATABASE_PASSWORD.length > 0 ? env.DATABASE_PASSWORD : undefined;
+  const password = envPassword ?? urlPassword;
+
+  const sslmode = (parsed.searchParams.get("sslmode") || env.PGSSLMODE || "").toLowerCase();
+  const isLocal =
+    host === "localhost" || host === "127.0.0.1" || host === "::1" || host.startsWith("/");
+  const strictSsl =
+    env.DATABASE_SSL_REJECT_UNAUTHORIZED === "1" || env.DATABASE_SSL_REJECT_UNAUTHORIZED === "true";
+
+  let ssl: PoolConfig["ssl"];
+  if (sslmode === "disable" || env.DATABASE_SSL === "0" || env.DATABASE_SSL === "false") {
+    ssl = false;
+  } else if (sslmode === "verify-full" || strictSsl) {
+    ssl = { rejectUnauthorized: true };
+  } else if (sslmode === "verify-ca") {
+    ssl = { rejectUnauthorized: true, checkServerIdentity: () => undefined };
+  } else if (!isLocal || sslmode === "require" || sslmode === "prefer" || sslmode === "no-verify" || env.DATABASE_SSL === "1") {
+    ssl = { rejectUnauthorized: false };
+  } else {
+    ssl = false;
+  }
+
+  const poolMax = Number(env.DATABASE_POOL_MAX || "10");
+  const config: PoolConfig = {
+    host,
+    port,
+    database,
+    ...(user !== undefined ? { user } : {}),
+    ...(password !== undefined ? { password } : {}),
+    ssl,
+    max: Number.isFinite(poolMax) && poolMax > 0 ? poolMax : 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 15_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
+    application_name: "securitypay-relay",
+  };
+
+  const lowerHost = host.toLowerCase();
+  const meta: PgConnectionMeta = {
+    host,
+    port,
+    database,
+    user,
+    sslEnabled: Boolean(ssl),
+    passwordLooksBracketed: Boolean(password && /^\[.+\]$/.test(password)),
+    passwordLooksPlaceholder: Boolean(
+      password && /your[-_ ]?password|tu[-_ ]?password|password_here/i.test(password),
+    ),
+    isSupabasePooler: lowerHost.endsWith(".pooler.supabase.com"),
+    isSupabaseDirect: /^db\.[a-z0-9-]+\.supabase\.co$/i.test(lowerHost),
+  };
+
+  return { config, meta };
+}
+
+/**
+ * Formats a secret-free diagnostic startup error for Postgres connection/auth failures.
+ * Never includes the password or raw DATABASE_URL.
+ */
+export function formatPgStartupError(err: unknown, meta: PgConnectionMeta): Error {
+  const e = err as { code?: string; message?: string };
+  const code = e?.code ?? "";
+  const msg = e?.message ?? String(err);
+  const target = `host=${meta.host}:${meta.port} user=${meta.user ?? "(none)"} db=${meta.database} ssl=${meta.sslEnabled ? "on" : "off"}`;
+
+  const hints: string[] = [];
+  if (code === "28P01" || /password authentication failed/i.test(msg)) {
+    if (meta.passwordLooksPlaceholder) {
+      hints.push("The password in DATABASE_URL still looks like a placeholder ([YOUR-PASSWORD] / [TU-PASSWORD]). Replace it with your actual database password.");
+    } else if (meta.passwordLooksBracketed) {
+      hints.push("The password in DATABASE_URL is wrapped in square brackets [...]. Remove the '[' and ']' characters around your password.");
+    }
+    if (meta.isSupabasePooler && meta.user === "postgres") {
+      hints.push("Supabase Connection Pooler requires username 'postgres.<project-ref>', not bare 'postgres'. Copy the exact URI from Supabase -> Connect -> Pooler.");
+    }
+    hints.push(
+      "Verify or reset the database password in Supabase (Settings -> Database -> Reset database password). If the password contains special characters (@, #, :, /, %, ?, &), URL-encode them or set DATABASE_PASSWORD as a separate environment variable.",
+    );
+  } else if (code === "ENETUNREACH" || code === "EHOSTUNREACH") {
+    if (meta.isSupabaseDirect) {
+      hints.push("Direct Supabase hosts (db.<ref>.supabase.co:5432) use IPv6, which Render cannot reach. Switch DATABASE_URL to the Supabase Connection Pooler URI (aws-0-<region>.pooler.supabase.com:6543 or :5432) with user 'postgres.<project-ref>'.");
+    } else {
+      hints.push("Network unreachable when connecting to Postgres. Verify the host supports IPv4 from Render.");
+    }
+  } else if (code === "XX000" && /tenant or user not found/i.test(msg)) {
+    hints.push("Supabase Pooler rejected the tenant/user. Make sure the username is 'postgres.<project-ref>' and the pooler region host matches your Supabase project.");
+  }
+
+  const detail = hints.length > 0 ? ` Hints: ${hints.join(" ")}` : "";
+  return new Error(`PostgreSQL connection failed (${target}): ${msg}.${detail}`, { cause: err });
+}
+
+interface PgQueryable {
+  query(sql: string, params?: unknown[]): Promise<{ rows: any[]; rowCount: number | null }>;
+}
+
 class PgStatement implements Statement {
-  constructor(private pool: any, private sql: string) {}
+  constructor(
+    private queryable: PgQueryable,
+    private sql: string,
+  ) {}
   async get(...params: unknown[]) {
-    const r = await this.pool.query(toPg(this.sql), params);
+    const r = await this.queryable.query(toPg(this.sql), params);
     return r.rows[0];
   }
   async all(...params: unknown[]) {
-    const r = await this.pool.query(toPg(this.sql), params);
+    const r = await this.queryable.query(toPg(this.sql), params);
     return r.rows;
   }
   async run(...params: unknown[]) {
-    const r = await this.pool.query(toPg(this.sql), params);
+    const r = await this.queryable.query(toPg(this.sql), params);
     return { changes: r.rowCount ?? 0 };
   }
 }
 
-class PgDb implements Db {
+class PgClientDb implements Db {
   dialect = "postgres" as const;
-  constructor(private pool: any) {}
-  prepare(sql: string): Statement { return new PgStatement(this.pool, sql); }
-  async exec(sql: string): Promise<void> { await this.pool.query(sql); }
-  async close(): Promise<void> { await this.pool.end(); }
-}
+  private spSeq = 0;
 
-async function runPgMigrations(pool: any, migrations: string[]): Promise<void> {
-  await pool.query("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)");
-  const r = await pool.query("SELECT version FROM schema_version");
-  let version = r.rows[0]?.version ?? 0;
-  if (r.rows.length === 0) await pool.query("INSERT INTO schema_version (version) VALUES (0)");
-  for (; version < migrations.length; version++) {
-    await pool.query("BEGIN");
+  constructor(private client: PgQueryable) {}
+  prepare(sql: string): Statement {
+    return new PgStatement(this.client, sql);
+  }
+  async exec(sql: string): Promise<void> {
+    await this.client.query(sql);
+  }
+  async transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
+    const sp = `sp_${++this.spSeq}`;
+    await this.client.query(`SAVEPOINT ${sp}`);
     try {
-      await pool.query(migrations[version]!);
-      await pool.query("UPDATE schema_version SET version = $1", [version + 1]);
-      await pool.query("COMMIT");
-    } catch (e) {
-      await pool.query("ROLLBACK");
-      throw e;
+      const result = await fn(this);
+      await this.client.query(`RELEASE SAVEPOINT ${sp}`);
+      return result;
+    } catch (err) {
+      await this.client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => undefined);
+      await this.client.query(`RELEASE SAVEPOINT ${sp}`).catch(() => undefined);
+      throw err;
     }
   }
+  async close(): Promise<void> {
+    // Lifecycle managed by the outer transaction.
+  }
 }
 
-export async function openDatabase(path: string, migrations: string[] = SQLITE_MIGRATIONS): Promise<Db> {
-  const url =
-    process.env.DATABASE_URL ||
-    process.env.SECURITYPAY_DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.SUPABASE_DB_URL;
-  if (url) {
-    const pg = await import("pg");
-    const pool = new (pg as any).Pool({ connectionString: url });
+export interface PgPoolLike extends PgQueryable {
+  connect(): Promise<Pick<PoolClient, "query" | "release">>;
+  end(): Promise<void>;
+  on?(event: string, listener: (...args: any[]) => void): unknown;
+}
+
+class PgDb implements Db {
+  dialect = "postgres" as const;
+  constructor(private pool: PgPoolLike) {}
+  prepare(sql: string): Statement {
+    return new PgStatement(this.pool, sql);
+  }
+  async exec(sql: string): Promise<void> {
+    await this.pool.query(sql);
+  }
+  async transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
     try {
-      (pg as any).types?.setTypeParser?.(20, (v: string | null) => (v === null ? null : Number(v)));
-    } catch {}
-    const mig = migrations === SQLITE_MIGRATIONS ? PG_MIGRATIONS : PG_MIGRATIONS;
-    await runPgMigrations(pool, mig);
+      await client.query("BEGIN");
+      const tx = new PgClientDb(client);
+      const result = await fn(tx);
+      await client.query("COMMIT");
+      return result;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+}
+
+export async function runPgMigrations(
+  pool: Pick<PgPoolLike, "connect">,
+  migrations: string[] = PG_MIGRATIONS,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    // Transaction-scoped advisory lock: safe under PgBouncer transaction pooling (port 6543)
+    // and prevents races when two instances boot during a rolling deploy.
+    await client.query("BEGIN");
+    try {
+      await client.query(`SELECT pg_advisory_xact_lock(${PG_MIGRATION_LOCK_KEY})`);
+      await client.query("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)");
+      const init = await client.query("SELECT version FROM schema_version");
+      if (init.rows.length === 0) {
+        await client.query("INSERT INTO schema_version (version) VALUES (0)");
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    }
+
+    for (let target = 1; target <= migrations.length; target++) {
+      await client.query("BEGIN");
+      try {
+        await client.query(`SELECT pg_advisory_xact_lock(${PG_MIGRATION_LOCK_KEY})`);
+        const cur = await client.query("SELECT version FROM schema_version");
+        const version = Number(cur.rows[0]?.version ?? 0);
+        if (version < target) {
+          await client.query(migrations[target - 1]!);
+          await client.query("UPDATE schema_version SET version = $1", [target]);
+        }
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw err;
+      }
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/** Creates a Postgres-backed Db from an existing pool (also used in tests). */
+export async function createPgDbFromPool(pool: PgPoolLike, migrations: string[] = PG_MIGRATIONS): Promise<Db> {
+  await runPgMigrations(pool, migrations);
+  return new PgDb(pool);
+}
+
+export async function openDatabase(
+  path: string,
+  migrations: string[] = SQLITE_MIGRATIONS,
+  opts: OpenDatabaseOptions = {},
+): Promise<Db> {
+  const url =
+    opts.forceSqlite || path === ":memory:"
+      ? undefined
+      : process.env.DATABASE_URL ||
+        process.env.SECURITYPAY_DATABASE_URL ||
+        process.env.POSTGRES_URL ||
+        process.env.SUPABASE_DB_URL;
+
+  if (url) {
+    // Prefer IPv4 on dual-stack hosts so Render containers don't fail with ENETUNREACH on IPv6.
+    try {
+      setDefaultResultOrder("ipv4first");
+    } catch {
+      // ignore if unsupported
+    }
+
+    const { config, meta } = parsePgConnectionConfig(url, process.env);
+    const pg = await import("pg");
+    const pgTypes = pg.types ?? pg.default?.types;
+    try {
+      // Parse PostgreSQL int8 (BIGINT / COUNT(*), OID 20) as JS numbers for parity with SQLite.
+      pgTypes?.setTypeParser?.(20, (v: string) => Number(v));
+    } catch {
+      // ignore if parser override fails
+    }
+
+    const PoolCtor = pg.Pool ?? pg.default?.Pool;
+    const pool: Pool = new PoolCtor(config);
+    // Prevent idle disconnects from Supabase/PgBouncer from crashing the process.
+    pool.on("error", (err) => {
+      console.error(`[db] idle postgres client error (${meta.host}:${meta.port}):`, err.message);
+    });
+
+    try {
+      const mig = migrations === SQLITE_MIGRATIONS ? PG_MIGRATIONS : migrations;
+      await runPgMigrations(pool, mig);
+    } catch (err) {
+      await pool.end().catch(() => undefined);
+      throw formatPgStartupError(err, meta);
+    }
     return new PgDb(pool);
   }
+
   const db = openSqliteDatabase(path, migrations);
   return new SqliteDb(db);
 }
 
-export function getMeta(db: Db, key: string): Promise<string | undefined> {
-  return (async () => {
-    const row = await db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined;
-    return row?.value;
-  })();
+export async function getMeta(db: Db, key: string): Promise<string | undefined> {
+  const row = (await db.prepare("SELECT value FROM meta WHERE key = ?").get(key)) as { value: string } | undefined;
+  return row?.value;
 }
 
-export function setMeta(db: Db, key: string, value: string): Promise<void> {
-  return (async () => {
-    await db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
-  })();
+export async function setMeta(db: Db, key: string, value: string): Promise<void> {
+  await db
+    .prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(key, value);
 }
 
 export async function metaOrInit(db: Db, key: string, make: () => string): Promise<string> {

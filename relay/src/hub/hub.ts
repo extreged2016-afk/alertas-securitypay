@@ -174,7 +174,7 @@ export class Hub {
       const t = await p.catch(() => undefined);
       if (!t) continue;
       const { ctx } = t.built;
-      if (now - t.lastUsed > idleMs && ctx.hub.socketCount() === 0 && !ctx.calls?.open()) {
+      if (now - t.lastUsed > idleMs && ctx.hub.socketCount() === 0 && !(await ctx.calls?.open())) {
         await this.unload(id);
         this.log.info({ tenant: id }, "tenant unloaded (idle)");
       }
@@ -225,11 +225,11 @@ export class Hub {
     const limits = patch.limits ? { ...t.record.limits, ...patch.limits } : undefined;
     await this.registry.update(t.record.tenant_id, { agent_name: patch.agent_name, limits, disabled: patch.disabled });
     t.record = (await this.registry.get(t.record.tenant_id))!;
-    if (limits) t.built.ctx.calls?.limitsChanged();
+    if (limits) await t.built.ctx.calls?.limitsChanged();
     if (patch.agent_name !== undefined) t.built.ctx.cfg.agentName = patch.agent_name;
     // Turned off: end its call and drop every socket now; reconnects get 403 tenant_disabled.
     if (patch.disabled) {
-      t.built.ctx.calls?.terminateOpen();
+      await t.built.ctx.calls?.terminateOpen();
       t.built.ctx.hub.closeAll();
     }
   }
@@ -279,7 +279,7 @@ export class Hub {
 
   async delete(tenantId: string): Promise<void> {
     const t = await this.loaded.get(tenantId)?.catch(() => undefined);
-    t?.built.ctx.calls?.terminateOpen();
+    await t?.built.ctx.calls?.terminateOpen();
     // Registry first: from here on no request can (re)load the tenant while it closes.
     await this.registry.delete(tenantId);
     this.revokeAgentTokens(tenantId);
@@ -464,7 +464,7 @@ export async function buildHub(cfg: Config, opts: HubOptions): Promise<{ app: Fa
       },
       async (req, reply) => {
         const t = await mustTenant(req.params.tid);
-        return reply.code(201).send(createPairingToken(t.built.ctx, req.body?.ttl_s ?? 600));
+        return reply.code(201).send(await createPairingToken(t.built.ctx, req.body?.ttl_s ?? 600));
       },
     );
 
@@ -488,14 +488,14 @@ export async function buildHub(cfg: Config, opts: HubOptions): Promise<{ app: Fa
     );
 
     scope.get<{ Params: { tid: string } }>("/admin/v1/tenants/:tid/devices", { schema: { params: TID_PARAMS } }, async (req) => ({
-      devices: listDevices((await mustTenant(req.params.tid)).built.ctx),
+      devices: await listDevices((await mustTenant(req.params.tid)).built.ctx),
     }));
 
     scope.delete<{ Params: { tid: string; device_id: string } }>(
       "/admin/v1/tenants/:tid/devices/:device_id",
       { schema: { params: TID_PARAMS } },
       async (req, reply) => {
-        revokeDevice((await mustTenant(req.params.tid)).built.ctx, req.params.device_id);
+        await revokeDevice((await mustTenant(req.params.tid)).built.ctx, req.params.device_id);
         return reply.code(204).send();
       },
     );

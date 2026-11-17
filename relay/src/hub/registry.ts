@@ -1,6 +1,6 @@
 import { sha256 } from "../auth.js";
 import { DatabaseSync } from "node:sqlite";
-import { openSqliteDatabase, SQLITE_MIGRATIONS } from "../db/database.js";
+import { openSqliteDatabase } from "../db/database.js";
 import { randomToken } from "../ids.js";
 import { type Limits, UNLIMITED } from "../quota.js";
 
@@ -50,7 +50,7 @@ export class Registry {
   readonly db: DatabaseSync;
 
   constructor(path: string) {
-    this.db = openSqliteDatabase(path, SQLITE_MIGRATIONS);
+    this.db = openSqliteDatabase(path, MIGRATIONS);
   }
 
   async get(tenantId: string): Promise<TenantRecord | undefined> {
