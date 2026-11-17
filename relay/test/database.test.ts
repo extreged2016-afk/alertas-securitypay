@@ -320,7 +320,7 @@ describe("web panel auto-login & access link", () => {
 
       const sw = await b.app.inject({ url: "/panel/sw.js" });
       expect(sw.statusCode).toBe(200);
-      expect(sw.body).toContain("securitypay-panel-v2");
+      expect(sw.body).toContain("securitypay-panel-v3");
     } finally {
       await b.app.close();
     }

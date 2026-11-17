@@ -40,4 +40,17 @@ describe("LiveKit config", () => {
     process.env.LIVEKIT_API_SECRET = "short";
     expect(() => loadConfig()).toThrow(/at least 32/);
   });
+
+  it("trims SECURITYPAY_API_KEY (including accidental quotes) and loads PANEL_PASSWORD", () => {
+    baseEnv();
+    process.env.SECURITYPAY_API_KEY = '  "ak_trimmed_1234"  ';
+    process.env.PANEL_PASSWORD = "  MiClaveFacil!  ";
+    const cfg = loadConfig();
+    expect(cfg.apiKey).toBe("ak_trimmed_1234");
+    expect(cfg.panelPassword).toBe("MiClaveFacil!");
+
+    delete process.env.PANEL_PASSWORD;
+    process.env.SECURITYPAY_PANEL_PASSWORD = "  FallbackClave  ";
+    expect(loadConfig().panelPassword).toBe("FallbackClave");
+  });
 });

@@ -16,6 +16,8 @@ export interface Config {
   agentName: string;
   /** Explicit API key from env; otherwise one is generated and persisted. */
   apiKey?: string;
+  /** Optional human-friendly password for the web panel (PANEL_PASSWORD or SECURITYPAY_PANEL_PASSWORD). */
+  panelPassword?: string;
   ringTimeoutS: number;
   /** Reverse proxies in front of the relay; the client address is read that many hops from the right of X-Forwarded-For. */
   trustedProxies?: number;
@@ -43,6 +45,24 @@ export const ANDROID_PACKAGE = "com.securitypay.alerts";
 function env(name: string, fallback?: string): string | undefined {
   const v = process.env[name];
   return v === undefined || v === "" ? fallback : v;
+}
+
+function trimmedEnv(name: string, fallback?: string): string | undefined {
+  const v = process.env[name]?.trim();
+  return v === undefined || v === "" ? fallback : v;
+}
+
+/**
+ * Cleans an identifier/token env var pasted into dashboards like Render:
+ * strips accidental leading/trailing whitespace and matching wrapping quotes.
+ */
+function cleanTokenEnv(name: string): string | undefined {
+  let v = process.env[name]?.trim();
+  if (!v) return undefined;
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v === "" ? undefined : v;
 }
 
 /**
@@ -108,15 +128,15 @@ function trustedProxies(value: string): number {
 }
 
 export function loadConfig(): Config {
-  const dataDir = env("SECURITYPAY_DATA_DIR", "./data")!;
-  const port = Number(env("PORT", "8080"));
+  const dataDir = trimmedEnv("SECURITYPAY_DATA_DIR", "./data")!;
+  const port = Number(trimmedEnv("PORT", "8080"));
   // Render sets RENDER_EXTERNAL_URL automatically, so a fresh deploy works without
   // copying the hostname by hand; SECURITYPAY_PUBLIC_URL always wins.
-  const publicUrl = env("SECURITYPAY_PUBLIC_URL", env("RENDER_EXTERNAL_URL", `http://localhost:${port}`))!.replace(
+  const publicUrl = trimmedEnv("SECURITYPAY_PUBLIC_URL", trimmedEnv("RENDER_EXTERNAL_URL", `http://localhost:${port}`))!.replace(
     /\/+$/,
     "",
   );
-  const insecureDev = env("SECURITYPAY_INSECURE_DEV") === "1";
+  const insecureDev = trimmedEnv("SECURITYPAY_INSECURE_DEV") === "1";
   if (!publicUrl.startsWith("https://") && !insecureDev) {
     throw new Error(
       `SECURITYPAY_PUBLIC_URL must be https:// (got ${publicUrl}). Set SECURITYPAY_INSECURE_DEV=1 for local development only.`,
@@ -124,8 +144,8 @@ export function loadConfig(): Config {
   }
 
   let fcm: Config["fcm"];
-  let saFile = env("FCM_SERVICE_ACCOUNT_FILE");
-  const gsFile = env("FCM_GOOGLE_SERVICES_FILE");
+  let saFile = trimmedEnv("FCM_SERVICE_ACCOUNT_FILE");
+  const gsFile = trimmedEnv("FCM_GOOGLE_SERVICES_FILE");
   const saJson = jsonEnv("FCM_SERVICE_ACCOUNT_JSON");
   const gsJson = jsonEnv("FCM_GOOGLE_SERVICES_JSON") ?? (gsFile ? readFileSync(gsFile, "utf8") : undefined);
   if (saJson && !saFile) saFile = persistSecret(dataDir, "firebase-service-account.json", saJson);
@@ -138,39 +158,40 @@ export function loadConfig(): Config {
     fcm = {
       serviceAccountFile: saFile,
       client: parseGoogleServices(JSON.parse(gsJson)),
-      apiBase: env("FCM_API_BASE", "https://fcm.googleapis.com")!,
+      apiBase: trimmedEnv("FCM_API_BASE", "https://fcm.googleapis.com")!,
     };
   }
 
   let livekit: LiveKitConfig | undefined;
-  const lkKey = env("LIVEKIT_API_KEY");
+  const lkKey = trimmedEnv("LIVEKIT_API_KEY");
   // Prefer a file (mounted read-only) so the secret never sits in the environment,
   // where `docker inspect` and deploy tooling would show it.
-  const lkSecretFile = env("LIVEKIT_API_SECRET_FILE");
-  const lkSecret = lkSecretFile ? readFileSync(lkSecretFile, "utf8").trim() : env("LIVEKIT_API_SECRET");
+  const lkSecretFile = trimmedEnv("LIVEKIT_API_SECRET_FILE");
+  const lkSecret = lkSecretFile ? readFileSync(lkSecretFile, "utf8").trim() : trimmedEnv("LIVEKIT_API_SECRET");
   if (lkKey || lkSecret) {
     if (!lkKey || !lkSecret) throw new Error("Set LIVEKIT_API_KEY and LIVEKIT_API_SECRET (or LIVEKIT_API_SECRET_FILE) to enable calls");
     // Anyone holding the secret can mint tokens for any call room.
     if (lkSecret.length < 32) throw new Error("LIVEKIT_API_SECRET must be at least 32 characters (generate one with: openssl rand -base64 32)");
     // By default LiveKit is served on the relay's own hostname (Caddy routes /rtc to it).
-    const lkPublic = env("LIVEKIT_URL", publicUrl.replace(/^http/, "ws"))!.replace(/\/+$/, "");
+    const lkPublic = trimmedEnv("LIVEKIT_URL", publicUrl.replace(/^http/, "ws"))!.replace(/\/+$/, "");
     livekit = {
       publicUrl: lkPublic,
-      apiUrl: env("LIVEKIT_API_URL", lkPublic.replace(/^ws/, "http"))!.replace(/\/+$/, ""),
+      apiUrl: trimmedEnv("LIVEKIT_API_URL", lkPublic.replace(/^ws/, "http"))!.replace(/\/+$/, ""),
       apiKey: lkKey,
       apiSecret: lkSecret,
     };
   }
 
   return {
-    host: env("HOST", "0.0.0.0")!,
+    host: trimmedEnv("HOST", "0.0.0.0")!,
     port,
     publicUrl,
     dataDir,
-    agentName: env("SECURITYPAY_AGENT_NAME", "Agent")!,
-    apiKey: env("SECURITYPAY_API_KEY"),
-    ringTimeoutS: Number(env("SECURITYPAY_RING_TIMEOUT_S", "30")),
-    trustedProxies: trustedProxies(env("SECURITYPAY_TRUSTED_PROXIES", "1")!),
+    agentName: trimmedEnv("SECURITYPAY_AGENT_NAME", "Agent")!,
+    apiKey: cleanTokenEnv("SECURITYPAY_API_KEY"),
+    panelPassword: trimmedEnv("PANEL_PASSWORD") ?? trimmedEnv("SECURITYPAY_PANEL_PASSWORD"),
+    ringTimeoutS: Number(trimmedEnv("SECURITYPAY_RING_TIMEOUT_S", "30")),
+    trustedProxies: trustedProxies(trimmedEnv("SECURITYPAY_TRUSTED_PROXIES", "1")!),
     insecureDev,
     fcm,
     livekit,

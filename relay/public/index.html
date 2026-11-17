@@ -11,7 +11,15 @@
     <link rel="stylesheet" href="/panel/styles.css" />
   </head>
   <body>
-    <div id="login" class="login">
+    <div id="boot" class="boot">
+      <div class="boot-inner">
+        <img src="/panel/icon.svg" alt="" class="brand-logo" />
+        <div class="spinner light"></div>
+        <p class="muted small">Comprobando sesión…</p>
+      </div>
+    </div>
+
+    <div id="login" class="login hidden">
       <div class="login-card">
         <div class="brand">
           <img src="/panel/icon.svg" alt="" class="brand-logo" />
@@ -20,19 +28,57 @@
             <div class="brand-sub">Centro de alertas ilimitado · autohospedado</div>
           </div>
         </div>
-        <h1>Conecta tu panel</h1>
-        <p class="muted">
-          Pega la clave de API del relay (<code>ak_...</code>). La encuentras en los logs del
-          servidor o en <code>/data/api_key</code>.
+        <h1>Iniciar sesión</h1>
+        <p id="login-hint" class="muted">
+          Introduce tu contraseña del panel o la clave de API (<code>ak_...</code>). Tu sesión
+          quedará guardada automáticamente en este navegador.
         </p>
-        <label for="relay-url">URL del relay</label>
-        <input id="relay-url" type="url" spellcheck="false" autocomplete="url" />
-        <label for="api-key">Clave de API</label>
-        <input id="api-key" type="password" spellcheck="false" autocomplete="off" placeholder="ak_..." />
-        <button id="login-btn" class="primary">Entrar</button>
-        <p id="login-error" class="error" role="alert"></p>
+
+        <form id="login-form" novalidate>
+          <input
+            type="text"
+            name="username"
+            value="admin"
+            autocomplete="username"
+            class="sr-only"
+            tabindex="-1"
+            aria-hidden="true"
+          />
+
+          <label id="secret-label" for="api-key">Contraseña</label>
+          <div class="secret-wrap">
+            <input
+              id="api-key"
+              name="password"
+              type="password"
+              spellcheck="false"
+              autocomplete="current-password"
+              placeholder="Escribe tu contraseña o clave ak_..."
+              required
+            />
+            <button id="toggle-secret" type="button" class="secret-toggle" aria-label="Mostrar u ocultar contraseña">
+              Mostrar
+            </button>
+          </div>
+
+          <label class="remember-row">
+            <input id="remember-me" type="checkbox" checked />
+            <span>Mantener sesión iniciada (30 días)</span>
+          </label>
+
+          <button id="login-btn" type="submit" class="primary">Entrar</button>
+          <p id="login-error" class="error" role="alert"></p>
+
+          <details class="advanced-login">
+            <summary>Conectar a otro servidor (avanzado)</summary>
+            <label for="relay-url">URL del relay</label>
+            <input id="relay-url" type="url" spellcheck="false" autocomplete="url" />
+          </details>
+        </form>
+
         <p class="muted small">
-          ¿Aún no tienes relay? Despliega el proyecto en Render o Docker. Todo es tuyo y sin límites.
+          ¿Prefieres entrar con una contraseña fácil? Define <code>PANEL_PASSWORD</code> en Render
+          o créala dentro del panel en <strong>Acceso y clave</strong>.
         </p>
       </div>
     </div>
@@ -47,7 +93,7 @@
           <span id="ws-pill" class="pill offline"><i></i><span>Desconectado</span></span>
           <button id="sound-btn" class="ghost" title="Activar o silenciar la alarma">🔔 Activar sonido</button>
           <button id="notify-btn" class="ghost" title="Permitir notificaciones del navegador">Permitir avisos</button>
-          <button id="copy-access-link" class="ghost" title="Copiar enlace de acceso automático para este navegador">Copiar enlace de acceso</button>
+          <button id="access-btn" class="ghost" title="Ver clave de API, contraseña y enlace de acceso rápido">🔑 Acceso y clave</button>
           <button id="logout-btn" class="ghost">Salir</button>
         </div>
       </header>
@@ -101,8 +147,25 @@
           <div>
             <h2>Conexión para tu backend</h2>
             <p class="muted small">Copia y pega en tu servicio de Render, n8n o script.</p>
+            <div id="key-box" class="key-box hidden">
+              <div class="key-box-head">
+                <span class="key-box-label">Clave de API activa</span>
+                <span id="key-source-badge" class="badge">—</span>
+              </div>
+              <div class="key-box-row">
+                <code id="api-key-display" class="key-value">ak_••••</code>
+                <div class="key-box-actions">
+                  <button id="toggle-api-key" type="button" class="ghost small-btn">Mostrar</button>
+                  <button id="copy-api-key" type="button" class="secondary small-btn">Copiar clave</button>
+                  <button id="rotate-api-key" type="button" class="ghost small-btn hidden">Rotar</button>
+                </div>
+              </div>
+            </div>
             <pre id="backend-snippet" class="code"></pre>
-            <button id="copy-snippet" class="secondary">Copiar ejemplo</button>
+            <div class="snippet-actions">
+              <button id="copy-snippet" class="secondary">Copiar ejemplo</button>
+              <button id="copy-snippet-with-key" class="ghost hidden">Copiar ejemplo con mi clave</button>
+            </div>
           </div>
           <div>
             <h2>Canales activos</h2>
@@ -151,6 +214,51 @@
       <div class="dialog-actions">
         <button id="test-cancel" class="ghost">Cancelar</button>
         <button id="test-send" class="primary">Enviar alerta</button>
+      </div>
+    </dialog>
+
+    <dialog id="access-dialog">
+      <div class="dialog-head">
+        <h2>Acceso y seguridad</h2>
+        <button id="access-close" class="icon-btn" aria-label="Cerrar">✕</button>
+      </div>
+
+      <div class="access-section">
+        <h3>Enlace de acceso en 1 clic</h3>
+        <p class="muted small">
+          Ábrelo en otro navegador o teléfono para iniciar sesión automáticamente y guardar la
+          sesión durante 30 días. El enlace limpia el token de la barra de direcciones al entrar.
+        </p>
+        <button id="copy-access-link" type="button" class="secondary">Copiar enlace de acceso</button>
+      </div>
+
+      <div class="access-section">
+        <h3>Contraseña del panel</h3>
+        <p id="password-status" class="muted small">Comprobando configuración…</p>
+        <form id="password-form" class="hidden" novalidate>
+          <label for="new-password">Nueva contraseña (mínimo 4 caracteres)</label>
+          <input
+            id="new-password"
+            type="password"
+            minlength="4"
+            maxlength="128"
+            autocomplete="new-password"
+            placeholder="Elige una contraseña fácil de recordar"
+          />
+          <div class="dialog-actions">
+            <button id="save-password-btn" type="submit" class="primary">Guardar contraseña</button>
+          </div>
+        </form>
+        <p id="password-msg" class="small" role="status"></p>
+      </div>
+
+      <div class="access-section">
+        <h3>Clave de API del servidor</h3>
+        <p id="api-key-origin-text" class="muted small">—</p>
+        <div class="snippet-actions">
+          <button id="dialog-copy-key" type="button" class="secondary small-btn">Copiar clave de API</button>
+          <button id="dialog-rotate-key" type="button" class="ghost small-btn hidden">Generar nueva clave</button>
+        </div>
       </div>
     </dialog>
 
