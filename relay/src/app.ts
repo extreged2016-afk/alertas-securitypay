@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import staticFiles from "@fastify/static";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from "fastify";
-import { Auth, sha256 } from "./auth.js";
+import { Auth } from "./auth.js";
 import { type Config, dbPath, trustedHops } from "./config.js";
 import type { Ctx } from "./context.js";
 import { type Db, metaOrInit, openDatabase } from "./db/database.js";
@@ -13,6 +13,7 @@ import { ApiError } from "./errors.js";
 import { EventLog } from "./events.js";
 import { newId, randomToken } from "./ids.js";
 import { LiveKitServer, type LiveKitService } from "./livekit.js";
+import { type ApiKeySource, PanelAuth } from "./panel-auth.js";
 import type { PushConfig } from "./protocol.js";
 import { type Limits, UNLIMITED } from "./quota.js";
 import { PushDispatcher } from "./push/dispatcher.js";
@@ -22,6 +23,7 @@ import { alertRoutes } from "./routes/alerts.js";
 import { Calls, callRoutes, targetsOf } from "./routes/calls.js";
 import { messageRoutes } from "./routes/messages.js";
 import { pairingRoutes } from "./routes/pairing.js";
+import { panelRoutes } from "./routes/panel.js";
 import { systemRoutes } from "./routes/system.js";
 import { WsHub, wsRoutes } from "./routes/ws.js";
 
@@ -61,10 +63,11 @@ export interface BuiltApp {
  * persisted in the database's meta table and in DATA_DIR/api_key (mode 0600), so
  * the operator can read it once. Requests are checked against its hash.
  */
-async function resolveApiKey(cfg: Config, db: Db): Promise<{ apiKey: string; generated: boolean }> {
-  if (cfg.apiKey) {
-    if (!cfg.apiKey.startsWith("ak_")) throw new Error("SECURITYPAY_API_KEY must start with ak_");
-    return { apiKey: cfg.apiKey, generated: false };
+async function resolveApiKey(cfg: Config, db: Db): Promise<{ apiKey: string; generated: boolean; source: ApiKeySource }> {
+  const fromEnv = cfg.apiKey?.trim();
+  if (fromEnv) {
+    if (!fromEnv.startsWith("ak_")) throw new Error("SECURITYPAY_API_KEY must start with ak_");
+    return { apiKey: fromEnv, generated: false, source: "env" };
   }
   let generated = false;
   const apiKey = await metaOrInit(db, "api_key", () => {
@@ -85,7 +88,7 @@ async function resolveApiKey(cfg: Config, db: Db): Promise<{ apiKey: string; gen
       }
     }
   }
-  return { apiKey, generated };
+  return { apiKey, generated, source: "database" };
 }
 
 export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<BuiltApp> {
@@ -95,12 +98,21 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
   let apiKey = "";
   let generated = false;
   let apiKeyHash: () => Buffer;
+  let panel: PanelAuth | undefined;
   if (opts.tenant) {
     apiKeyHash = opts.tenant.apiKeyHash;
   } else {
-    ({ apiKey, generated } = await resolveApiKey(cfg, db));
-    const hash = sha256(apiKey);
-    apiKeyHash = () => hash;
+    let source: ApiKeySource;
+    ({ apiKey, generated, source } = await resolveApiKey(cfg, db));
+    panel = await PanelAuth.create({
+      db,
+      cfg,
+      jwtSecret,
+      relayId,
+      initialApiKey: apiKey,
+      apiKeySource: source,
+    });
+    apiKeyHash = () => panel!.apiKeyHash();
   }
 
   const app = Fastify({
@@ -122,6 +134,7 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
     log: app.log,
     db,
     auth: new Auth(db, apiKeyHash, jwtSecret, relayId, opts.tenant?.agentToken),
+    panel,
     events,
     relayId,
     pushConfig,
@@ -131,6 +144,10 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
     limits: opts.tenant?.limits ?? (() => UNLIMITED),
     roomPrefix: opts.tenant?.roomPrefix ?? "",
   };
+  panel?.setRotationHook(async () => {
+    await db.prepare("DELETE FROM pairing_tokens WHERE used_at IS NULL").run();
+    ctx.hub.disconnectAgent();
+  });
   if (!ctx.livekit && !opts.tenant) app.log.warn("LiveKit is not configured: calls are disabled");
   const calls = new Calls(ctx);
   ctx.calls = calls;
@@ -170,11 +187,20 @@ export async function buildApp(cfg: Config, opts: BuildOptions = {}): Promise<Bu
     index: ["index.html"],
     decorateReply: false,
     wildcard: false,
+    cacheControl: false,
+    setHeaders: (res, filePath) => {
+      if (/\.(html|js|css|webmanifest)$/i.test(filePath)) {
+        res.setHeader("Cache-Control", "no-cache");
+      } else {
+        res.setHeader("Cache-Control", "public, max-age=3600");
+      }
+    },
   });
   app.get("/", async (_req, reply) => reply.redirect("/panel/"));
   app.get("/panel", async (_req, reply) => reply.redirect("/panel/"));
 
   systemRoutes(app, ctx);
+  panelRoutes(app, ctx);
   pairingRoutes(app, ctx);
   alertRoutes(app, ctx);
   messageRoutes(app, ctx);

@@ -1,5 +1,5 @@
 /* Minimal PWA shell cache (network-first so deployed updates take effect immediately). */
-const CACHE = "securitypay-panel-v2";
+const CACHE = "securitypay-panel-v3";
 const SHELL = ["/panel/", "/panel/styles.css", "/panel/app.js", "/panel/icon.svg", "/panel/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

@@ -1,10 +1,13 @@
 /* Alert SecurityPay · panel web (sin dependencias de build) */
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "securitypay.panel.v1";
 
 const state = {
   server: localStorage.getItem("securitypay.server") || location.origin,
-  token: localStorage.getItem("securitypay.token") || "",
+  token: "",
+  authMode: null, // "cookie" | "token" | null
+  sessionInfo: null,
+  credentials: null,
+  revealKey: false,
   status: null,
   alerts: new Map(),
   filter: "all",
@@ -21,18 +24,25 @@ const state = {
   sirenStop: null,
   livekitRoom: null,
   lastSpoken: 0,
-  seen: new Set(),
 };
 
 const PRIORITY_LABEL = { critical: "Crítica", high: "Alta", normal: "Normal", low: "Baja" };
-const PRIORITY_ORDER = { critical: 0, high: 1, normal: 2, low: 3 };
+
+function isSameOrigin(server = state.server) {
+  return (server || "").replace(/\/+$/, "") === location.origin.replace(/\/+$/, "");
+}
 
 function api(path, options = {}) {
   const base = state.server.replace(/\/+$/, "");
   const headers = { ...(options.headers || {}) };
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
   if (options.body && !headers["content-type"]) headers["content-type"] = "application/json";
-  return fetch(base + path, { ...options, headers }).then(async (res) => {
+  const same = isSameOrigin(base);
+  return fetch(base + path, {
+    ...options,
+    headers,
+    ...(same ? { credentials: "same-origin" } : {}),
+  }).then(async (res) => {
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -40,6 +50,7 @@ function api(path, options = {}) {
       const message = data?.error?.message || `HTTP ${res.status}`;
       const err = new Error(message);
       err.status = res.status;
+      err.code = data?.error?.code;
       throw err;
     }
     return data;
@@ -48,6 +59,9 @@ function api(path, options = {}) {
 
 function wsUrl(afterSeq = 0) {
   const base = state.server.replace(/\/+$/, "").replace(/^http/, "ws");
+  if (state.authMode === "cookie" && !state.token) {
+    return `${base}/ws/relay?after_seq=${afterSeq}`;
+  }
   return `${base}/ws/relay?token=${encodeURIComponent(state.token)}&after_seq=${afterSeq}`;
 }
 
@@ -67,24 +81,104 @@ function ago(ms) {
   return `hace ${Math.floor(s / 86400)} d`;
 }
 
+/* ---------- view helpers ---------- */
+function showBoot(visible) {
+  $("boot")?.classList.toggle("hidden", !visible);
+}
+
+function showLoginView(errorMsg = "") {
+  showBoot(false);
+  $("app").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  $("relay-url").value = state.server;
+  if (!isSameOrigin()) {
+    const adv = document.querySelector(".advanced-login");
+    if (adv) adv.open = true;
+  }
+  if (errorMsg) $("login-error").textContent = errorMsg;
+  applySessionHints(state.sessionInfo);
+}
+
+function applySessionHints(info) {
+  const hint = $("login-hint");
+  const label = $("secret-label");
+  const input = $("api-key");
+  if (!hint || !label || !input) return;
+  if (info?.password_configured) {
+    label.textContent = "Contraseña del panel";
+    input.placeholder = "Escribe tu contraseña";
+    hint.textContent =
+      "Introduce tu contraseña del panel (también acepta la clave ak_...). Tu sesión quedará guardada automáticamente en este navegador.";
+  } else {
+    label.textContent = "Contraseña o clave de API";
+    input.placeholder = "Pega tu clave ak_... o contraseña";
+    hint.innerHTML =
+      'Introduce tu clave de API (<code>ak_...</code>) para entrar. Si prefieres una contraseña fácil, añade <code>PANEL_PASSWORD</code> en Render.';
+  }
+}
+
 /* ---------- login ---------- */
-async function login() {
-  const server = $("relay-url").value.trim().replace(/\/+$/, "");
-  const token = $("api-key").value.trim();
+async function login(event) {
+  if (event) event.preventDefault();
+  const rawUrl = $("relay-url").value.trim().replace(/\/+$/, "");
+  const server = rawUrl || location.origin;
+  const secret = $("api-key").value.trim();
+  const remember = $("remember-me")?.checked !== false;
+  const btn = $("login-btn");
+
   $("login-error").textContent = "";
-  if (!server || !token) { $("login-error").textContent = "Escribe la URL y la clave de API."; return; }
-  if (!/^https?:\/\//.test(server)) { $("login-error").textContent = "La URL debe empezar por https://"; return; }
-  state.server = server;
-  state.token = token;
-  try {
-    state.status = await api("/v1/status");
-  } catch (e) {
-    $("login-error").textContent = e.status === 401 ? "La clave de API no es válida." : `No se pudo conectar: ${e.message}`;
+  if (!secret) {
+    $("login-error").textContent = "Escribe tu contraseña o clave de API.";
+    $("api-key").focus();
     return;
   }
-  localStorage.setItem("securitypay.server", server);
-  localStorage.setItem("securitypay.token", token);
-  showApp();
+  if (!/^https?:\/\//.test(server)) {
+    $("login-error").textContent = "La URL del servidor debe empezar por https://";
+    return;
+  }
+
+  state.server = server;
+  btn.disabled = true;
+  btn.textContent = "Entrando…";
+
+  try {
+    if (isSameOrigin(server)) {
+      state.token = "";
+      await api("/v1/panel/login", {
+        method: "POST",
+        body: JSON.stringify({ secret, remember }),
+      });
+      state.authMode = "cookie";
+      localStorage.setItem("securitypay.server", server);
+      localStorage.removeItem("securitypay.token");
+      $("api-key").value = "";
+      showApp();
+      return;
+    }
+
+    // Remote relay fallback: authenticate directly with Bearer token.
+    state.token = secret;
+    state.status = await api("/v1/status");
+    state.authMode = "token";
+    localStorage.setItem("securitypay.server", server);
+    localStorage.setItem("securitypay.token", secret);
+    $("api-key").value = "";
+    showApp();
+  } catch (e) {
+    state.token = "";
+    state.authMode = null;
+    if (e.status === 429) {
+      $("login-error").textContent = e.message || "Demasiados intentos. Espera un minuto.";
+    } else if (e.status === 401) {
+      $("login-error").textContent =
+        "Contraseña o clave de API no válida. Comprueba que no haya errores o revisa PANEL_PASSWORD en Render.";
+    } else {
+      $("login-error").textContent = `No se pudo conectar: ${e.message}`;
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Entrar";
+  }
 }
 
 function readHashAuth() {
@@ -101,9 +195,11 @@ function readHashAuth() {
 }
 
 function buildAccessLink() {
+  const secret = state.credentials?.api_key || state.token;
+  if (!secret) return "";
   const base = `${location.origin}${location.pathname}`;
   const params = new URLSearchParams();
-  params.set("token", state.token);
+  params.set("token", secret);
   const currentOrigin = location.origin.replace(/\/+$/, "");
   if (state.server && state.server.replace(/\/+$/, "") !== currentOrigin) {
     params.set("server", state.server.replace(/\/+$/, ""));
@@ -128,24 +224,31 @@ async function copyText(text) {
 }
 
 function showApp() {
+  showBoot(false);
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   updateSnippet();
   refreshAll().finally(() => connectWs());
 }
 
-function logout() {
+async function logout(notifyServer = true) {
   stopSiren();
   clearTimeout(state.wsTimer);
   if (state.ws) { state.ws.onclose = null; state.ws.close(); state.ws = null; }
   if (state.livekitRoom) { try { state.livekitRoom.disconnect(); } catch {} state.livekitRoom = null; }
+  if (notifyServer && isSameOrigin()) {
+    try { await api("/v1/panel/logout", { method: "POST" }); } catch {}
+  }
   localStorage.removeItem("securitypay.token");
   state.token = "";
+  state.authMode = null;
+  state.credentials = null;
+  state.revealKey = false;
   state.lastSeq = 0;
   state.helloSeq = 0;
   state.initialSyncDone = false;
-  $("app").classList.add("hidden");
-  $("login").classList.remove("hidden");
+  $("access-dialog")?.close?.();
+  showLoginView();
 }
 
 /* ---------- data ---------- */
@@ -158,9 +261,65 @@ async function refreshAll() {
     render();
     updateStatus(status);
     updateSnippet();
+    await loadCredentials();
   } catch (e) {
-    if (e.status === 401) logout();
+    if (e.status === 401) {
+      void logout(false);
+      return;
+    }
     console.warn("refresh failed", e);
+  }
+}
+
+async function loadCredentials() {
+  try {
+    const creds = await api("/v1/panel/credentials");
+    state.credentials = creds;
+    renderCredentials();
+  } catch {
+    state.credentials = null;
+    $("key-box")?.classList.add("hidden");
+    $("copy-snippet-with-key")?.classList.add("hidden");
+  }
+}
+
+function renderCredentials() {
+  const c = state.credentials;
+  const box = $("key-box");
+  if (!c || !box) return;
+  box.classList.remove("hidden");
+  $("copy-snippet-with-key")?.classList.remove("hidden");
+
+  const isEnvKey = c.api_key_source === "env";
+  $("key-source-badge").textContent = isEnvKey ? "Variable Render" : "Base de datos";
+  $("api-key-display").textContent = state.revealKey ? c.api_key : c.api_key_hint;
+  $("toggle-api-key").textContent = state.revealKey ? "Ocultar" : "Mostrar";
+  $("rotate-api-key")?.classList.toggle("hidden", !c.can_rotate_api_key);
+  $("dialog-rotate-key")?.classList.toggle("hidden", !c.can_rotate_api_key);
+
+  const originText = $("api-key-origin-text");
+  if (originText) {
+    originText.textContent = isEnvKey
+      ? `Clave activa (${c.api_key_hint}) cargada desde la variable de entorno SECURITYPAY_API_KEY. Si la quitas de Render, el servidor la gestionará en Supabase y podrás rotarla desde aquí.`
+      : `Clave activa (${c.api_key_hint}) generada y guardada en tu base de datos. Puedes copiarla o rotarla en cualquier momento.`;
+  }
+
+  const pwStatus = $("password-status");
+  const pwForm = $("password-form");
+  if (pwStatus && pwForm) {
+    if (c.password_source === "env") {
+      pwStatus.textContent =
+        "Activa mediante la variable de entorno PANEL_PASSWORD en Render. Para cambiarla, edítala en Render.";
+      pwForm.classList.add("hidden");
+    } else if (c.password_source === "database") {
+      pwStatus.textContent =
+        "Tienes una contraseña simple guardada en el panel. Si la cambias, las sesiones antiguas se cerrarán automáticamente.";
+      pwForm.classList.remove("hidden");
+    } else {
+      pwStatus.textContent =
+        "Aún no tienes una contraseña simple configurada. Crea una aquí para entrar sin tener que pegar la clave ak_... cada vez:";
+      pwForm.classList.remove("hidden");
+    }
   }
 }
 
@@ -168,16 +327,17 @@ function updateStatus(status) {
   $("push-state").textContent = status.push_provider === "none" ? "No configurado" : status.push_provider.toUpperCase();
   $("voice-state").textContent = status.voice_enabled ? "LiveKit configurado" : "Voz local (TTS)";
   $("relay-version").textContent = `${status.version} · ${status.relay_id || ""}`;
-  $("ws-url").textContent = wsUrl().replace(state.token, "ak_•••");
+  const baseWs = state.server.replace(/\/+$/, "").replace(/^http/, "ws");
+  $("ws-url").textContent = `${baseWs}/ws/relay`;
 }
 
-function updateSnippet() {
+function buildSnippet(apiKeyPlaceholder = "TU_CLAVE_API") {
   const base = state.server.replace(/\/+$/, "");
-  const snippet = `// Node.js / Render: envía una alerta al relay
+  return `// Node.js / Render: envía una alerta al relay
 await fetch("${base}/v1/alerts", {
   method: "POST",
   headers: {
-    "Authorization": "Bearer TU_CLAVE_API",
+    "Authorization": "Bearer ${apiKeyPlaceholder}",
     "Content-Type": "application/json"
   },
   body: JSON.stringify({
@@ -189,16 +349,19 @@ await fetch("${base}/v1/alerts", {
     data: { service: "api", region: "oregon" }
   })
 });`;
-  $("backend-snippet").textContent = snippet;
+}
+
+function updateSnippet() {
+  $("backend-snippet").textContent = buildSnippet("TU_CLAVE_API");
 }
 
 /* ---------- WebSocket ---------- */
 function connectWs() {
-  if (!state.token) return;
+  if (!state.authMode) return;
   clearTimeout(state.wsTimer);
   setWsState("connecting");
   let ws;
-  try { ws = new WebSocket(wsUrl(state.lastSeq)); } catch (e) { scheduleReconnect(); return; }
+  try { ws = new WebSocket(wsUrl(state.lastSeq)); } catch { scheduleReconnect(); return; }
   state.ws = ws;
   ws.onopen = () => {
     state.wsAttempts = 0;
@@ -209,16 +372,20 @@ function connectWs() {
     try { evt = JSON.parse(event.data); } catch { return; }
     handleEvent(evt);
   };
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     setWsState("offline");
     if (state.ws === ws) state.ws = null;
+    if (event.code === 4401) {
+      void logout(false);
+      return;
+    }
     scheduleReconnect();
   };
   ws.onerror = () => { try { ws.close(); } catch {} };
 }
 
 function scheduleReconnect() {
-  if (!state.token) return;
+  if (!state.authMode) return;
   const delay = Math.min(30000, 1000 * 2 ** Math.min(state.wsAttempts, 5));
   state.wsAttempts++;
   clearTimeout(state.wsTimer);
@@ -454,16 +621,19 @@ function notifyAlert(alert) {
   } catch {}
 }
 
-/* ---------- dialogs ---------- */
+/* ---------- dialogs & credentials ---------- */
 async function openPair() {
   const dialog = $("pair-dialog");
   $("qr-wrap").innerHTML = '<div class="spinner"></div>';
   dialog.showModal();
   try {
     const token = await api("/v1/pairing-tokens", { method: "POST", body: JSON.stringify({ ttl_s: 600 }) });
+    const headers = { "content-type": "application/json" };
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
     const res = await fetch(`${state.server.replace(/\/+$/, "")}/v1/pairing-qr`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${state.token}`, "content-type": "application/json" },
+      headers,
+      ...(isSameOrigin() ? { credentials: "same-origin" } : {}),
       body: JSON.stringify({ data: token.qr_payload }),
     });
     if (!res.ok) throw new Error(`QR HTTP ${res.status}`);
@@ -493,13 +663,12 @@ async function sendTest() {
   };
   $("test-send").disabled = true;
   try {
-    const alert = await api("/v1/alerts", { method: "POST", body: JSON.stringify(body) });
-    state.alerts.set(alert.alert_id, alert);
+    const alertObj = await api("/v1/alerts", { method: "POST", body: JSON.stringify(body) });
+    state.alerts.set(alertObj.alert_id, alertObj);
     render();
     $("test-dialog").close();
     if (body.priority === "critical") {
-      // The WebSocket event normally does this; this covers a slow socket.
-      setTimeout(() => { if (!state.alerts.get(alert.alert_id)?.acked_at) speakAndVoice(alert); }, 600);
+      setTimeout(() => { if (!state.alerts.get(alertObj.alert_id)?.acked_at) speakAndVoice(alertObj); }, 600);
     }
   } catch (e) {
     alert(`No se pudo enviar: ${e.message}`);
@@ -508,54 +677,210 @@ async function sendTest() {
   }
 }
 
+async function savePanelPassword(event) {
+  event.preventDefault();
+  const input = $("new-password");
+  const msg = $("password-msg");
+  const btn = $("save-password-btn");
+  const pw = input.value.trim();
+  msg.className = "small";
+  msg.textContent = "";
+  if (pw.length < 4) {
+    msg.classList.add("error");
+    msg.textContent = "La contraseña debe tener al menos 4 caracteres.";
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await api("/v1/panel/password", { method: "POST", body: JSON.stringify({ password: pw }) });
+    input.value = "";
+    msg.classList.add("ok-text");
+    msg.textContent = "¡Contraseña guardada! Ya puedes entrar con ella y tu sesión sigue activa.";
+    await loadCredentials();
+  } catch (e) {
+    msg.classList.add("error");
+    msg.textContent = e.message || "No se pudo guardar la contraseña.";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function rotateApiKey() {
+  if (!confirm("¿Generar una nueva clave de API? Tendrás que actualizarla en tu backend y en el agente de voz.")) {
+    return;
+  }
+  try {
+    const res = await api("/v1/panel/rotate-api-key", { method: "POST" });
+    if (state.credentials) {
+      state.credentials.api_key = res.api_key;
+      state.credentials.api_key_hint = res.api_key_hint;
+    }
+    state.revealKey = true;
+    renderCredentials();
+  } catch (e) {
+    alert(`No se pudo rotar la clave: ${e.message}`);
+  }
+}
+
+function flashCopied(btn, label = "¡Copiado!") {
+  const prev = btn.textContent;
+  btn.textContent = label;
+  setTimeout(() => { btn.textContent = prev; }, 1800);
+}
+
 /* ---------- boot ---------- */
-function boot() {
+async function boot() {
+  bindEvents();
+
   const hashAuth = readHashAuth();
   if (hashAuth) {
     if (hashAuth.server) state.server = hashAuth.server;
-    state.token = hashAuth.token;
-  }
-  $("relay-url").value = state.server;
-  if (state.token) {
-    api("/v1/status").then((status) => {
-      state.status = status;
-      localStorage.setItem("securitypay.server", state.server);
-      localStorage.setItem("securitypay.token", state.token);
-      showApp();
-    }).catch((e) => {
-      $("relay-url").value = state.server;
-      if (hashAuth) {
-        state.token = "";
-        $("login-error").textContent =
-          e.status === 401
-            ? "La clave de API del enlace no es válida."
-            : `No se pudo conectar con el enlace: ${e.message}`;
-      }
-    });
-  }
-  $("login-btn").addEventListener("click", login);
-  $("api-key").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
-  $("logout-btn").addEventListener("click", logout);
-  $("copy-access-link")?.addEventListener("click", async () => {
-    if (!state.token) return;
-    const btn = $("copy-access-link");
+    $("relay-url").value = state.server;
     try {
-      await copyText(buildAccessLink());
-      const prev = btn.textContent;
-      btn.textContent = "¡Enlace copiado!";
-      setTimeout(() => { btn.textContent = prev; }, 2000);
+      if (isSameOrigin()) {
+        await api("/v1/panel/login", {
+          method: "POST",
+          body: JSON.stringify({ secret: hashAuth.token, remember: true }),
+        });
+        state.authMode = "cookie";
+        state.token = "";
+        localStorage.setItem("securitypay.server", state.server);
+        localStorage.removeItem("securitypay.token");
+      } else {
+        state.token = hashAuth.token;
+        state.status = await api("/v1/status");
+        state.authMode = "token";
+        localStorage.setItem("securitypay.server", state.server);
+        localStorage.setItem("securitypay.token", state.token);
+      }
+      showApp();
+      return;
+    } catch (e) {
+      state.token = "";
+      state.authMode = null;
+      showLoginView(
+        e.status === 401
+          ? "El enlace de acceso no es válido o ha caducado."
+          : `No se pudo conectar con el enlace: ${e.message}`,
+      );
+      return;
+    }
+  }
+
+  $("relay-url").value = state.server;
+
+  if (isSameOrigin()) {
+    try {
+      const session = await api("/v1/panel/session");
+      state.sessionInfo = session;
+      if (session.authenticated) {
+        state.authMode = "cookie";
+        state.token = "";
+        localStorage.removeItem("securitypay.token");
+        showApp();
+        return;
+      }
+      // Seamlessly upgrade any legacy localStorage token into a 30-day HttpOnly cookie.
+      const legacyToken = (localStorage.getItem("securitypay.token") || "").trim();
+      if (legacyToken && session.supported) {
+        try {
+          await api("/v1/panel/login", {
+            method: "POST",
+            body: JSON.stringify({ secret: legacyToken, remember: true }),
+          });
+          localStorage.removeItem("securitypay.token");
+          state.authMode = "cookie";
+          state.token = "";
+          showApp();
+          return;
+        } catch {
+          localStorage.removeItem("securitypay.token");
+        }
+      }
+    } catch {
+      // Server unreachable or older relay: fall through to login screen.
+    }
+    showLoginView();
+    return;
+  }
+
+  // Remote server saved in localStorage.
+  const savedToken = (localStorage.getItem("securitypay.token") || "").trim();
+  if (savedToken) {
+    state.token = savedToken;
+    try {
+      state.status = await api("/v1/status");
+      state.authMode = "token";
+      showApp();
+      return;
+    } catch {
+      state.token = "";
+    }
+  }
+  showLoginView();
+}
+
+function bindEvents() {
+  $("login-form")?.addEventListener("submit", login);
+  $("toggle-secret")?.addEventListener("click", () => {
+    const inp = $("api-key");
+    const btn = $("toggle-secret");
+    const hidden = inp.type === "password";
+    inp.type = hidden ? "text" : "password";
+    btn.textContent = hidden ? "Ocultar" : "Mostrar";
+    inp.focus();
+  });
+
+  $("logout-btn")?.addEventListener("click", () => void logout(true));
+  $("access-btn")?.addEventListener("click", () => {
+    $("password-msg").textContent = "";
+    void loadCredentials();
+    $("access-dialog").showModal();
+  });
+  $("access-close")?.addEventListener("click", () => $("access-dialog").close());
+  $("password-form")?.addEventListener("submit", savePanelPassword);
+
+  $("copy-access-link")?.addEventListener("click", async () => {
+    const link = buildAccessLink();
+    if (!link) return;
+    try {
+      await copyText(link);
+      flashCopied($("copy-access-link"), "¡Enlace copiado!");
     } catch {
       alert("No se pudo copiar el enlace al portapapeles.");
     }
   });
-  $("refresh-btn").addEventListener("click", refreshAll);
-  $("pair-btn").addEventListener("click", openPair);
-  $("pair-close").addEventListener("click", () => $("pair-dialog").close());
-  $("test-btn").addEventListener("click", () => $("test-dialog").showModal());
-  $("test-close").addEventListener("click", () => $("test-dialog").close());
-  $("test-cancel").addEventListener("click", () => $("test-dialog").close());
-  $("test-send").addEventListener("click", sendTest);
-  $("sound-btn").addEventListener("click", async () => {
+
+  $("toggle-api-key")?.addEventListener("click", () => {
+    state.revealKey = !state.revealKey;
+    renderCredentials();
+  });
+  $("copy-api-key")?.addEventListener("click", async () => {
+    if (!state.credentials?.api_key) return;
+    try {
+      await copyText(state.credentials.api_key);
+      flashCopied($("copy-api-key"), "¡Clave copiada!");
+    } catch {}
+  });
+  $("dialog-copy-key")?.addEventListener("click", async () => {
+    if (!state.credentials?.api_key) return;
+    try {
+      await copyText(state.credentials.api_key);
+      flashCopied($("dialog-copy-key"), "¡Clave copiada!");
+    } catch {}
+  });
+  $("rotate-api-key")?.addEventListener("click", rotateApiKey);
+  $("dialog-rotate-key")?.addEventListener("click", rotateApiKey);
+
+  $("refresh-btn")?.addEventListener("click", refreshAll);
+  $("pair-btn")?.addEventListener("click", openPair);
+  $("pair-close")?.addEventListener("click", () => $("pair-dialog").close());
+  $("test-btn")?.addEventListener("click", () => $("test-dialog").showModal());
+  $("test-close")?.addEventListener("click", () => $("test-dialog").close());
+  $("test-cancel")?.addEventListener("click", () => $("test-dialog").close());
+  $("test-send")?.addEventListener("click", sendTest);
+
+  $("sound-btn")?.addEventListener("click", async () => {
     state.sound = !state.sound;
     $("sound-btn").textContent = state.sound ? "🔕 Silenciar alarma" : "🔔 Activar sonido";
     if (state.sound) {
@@ -572,15 +897,28 @@ function boot() {
       }
     } else stopSiren();
   });
-  $("notify-btn").addEventListener("click", async () => {
+
+  $("notify-btn")?.addEventListener("click", async () => {
     if (!("Notification" in window)) return alert("Este navegador no soporta notificaciones.");
     const p = await Notification.requestPermission();
     state.notify = p === "granted";
     $("notify-btn").textContent = state.notify ? "Avisos activados" : "Permitir avisos";
   });
-  $("copy-snippet").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText($("backend-snippet").textContent); $("copy-snippet").textContent = "¡Copiado!"; setTimeout(() => ($("copy-snippet").textContent = "Copiar ejemplo"), 1500); } catch {}
+
+  $("copy-snippet")?.addEventListener("click", async () => {
+    try {
+      await copyText($("backend-snippet").textContent);
+      flashCopied($("copy-snippet"), "¡Copiado!");
+    } catch {}
   });
+  $("copy-snippet-with-key")?.addEventListener("click", async () => {
+    if (!state.credentials?.api_key) return;
+    try {
+      await copyText(buildSnippet(state.credentials.api_key));
+      flashCopied($("copy-snippet-with-key"), "¡Ejemplo con clave copiado!");
+    } catch {}
+  });
+
   for (const chip of document.querySelectorAll("[data-filter]")) {
     chip.addEventListener("click", () => {
       state.filter = chip.dataset.filter;
@@ -588,10 +926,11 @@ function boot() {
       render();
     });
   }
+
   setInterval(render, 30000);
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/panel/sw.js").catch(() => {});
   }
 }
 
-boot();
+void boot();

@@ -35,8 +35,14 @@ services:
         sync: false
       - key: DATABASE_PASSWORD
         sync: false
+      # Contraseña simple para entrar al panel web (/panel/). Al iniciar sesión se
+      # guarda una cookie HttpOnly de 30 días que sobrevive reinicios en Render.
+      # También puedes cambiarla desde el propio panel si no defines esta variable.
+      - key: PANEL_PASSWORD
+        sync: false
       # Opcional: fija la API key (ak_...) por variable de entorno. Si se omite, se
-      # genera una sola vez y queda persistida en Postgres (tabla meta) y /data/api_key.
+      # genera una sola vez y queda persistida en Postgres (tabla meta) y /data/api_key
+      # (puedes verla, copiarla y rotarla desde dentro del panel en "Acceso y clave").
       - key: SECURITYPAY_API_KEY
         sync: false
       - key: SECURITYPAY_AGENT_NAME

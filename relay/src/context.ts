@@ -5,6 +5,7 @@ import type { Db } from "./db/database.js";
 import type { EventLog } from "./events.js";
 import type { LiveKitService } from "./livekit.js";
 import { forbidden } from "./errors.js";
+import type { PanelAuth } from "./panel-auth.js";
 import type { PushConfig } from "./protocol.js";
 import type { Limits } from "./quota.js";
 import type { Calls } from "./routes/calls.js";
@@ -15,6 +16,8 @@ export interface Ctx {
   log: FastifyBaseLogger;
   db: Db;
   auth: Auth;
+  /** Present on self-hosted relays; undefined for hub tenants. */
+  panel?: PanelAuth;
   events: EventLog;
   relayId: string;
   pushConfig: PushConfig;
@@ -37,10 +40,23 @@ declare module "fastify" {
 
 type Kind = Principal["kind"];
 
+async function authenticateRequest(ctx: Ctx, req: FastifyRequest, queryToken?: string): Promise<Principal> {
+  if (queryToken && queryToken.length > 0) {
+    return ctx.auth.authenticate(`Bearer ${queryToken}`);
+  }
+  if (req.headers.authorization && req.headers.authorization.length > 0) {
+    return ctx.auth.authenticate(req.headers.authorization);
+  }
+  if (ctx.panel && (await ctx.panel.authenticateCookie(req))) {
+    return { kind: "agent" };
+  }
+  return ctx.auth.authenticate(undefined);
+}
+
 /** Fastify preHandler that authenticates and restricts to the given principal kinds. */
 export function requireAuth(ctx: Ctx, ...kinds: Kind[]) {
   return async (req: FastifyRequest) => {
-    const p = await ctx.auth.authenticate(req.headers.authorization);
+    const p = await authenticateRequest(ctx, req);
     if (!kinds.includes(p.kind)) throw forbidden(`This endpoint is not available to ${p.kind} credentials`);
     req.principal = p;
   };
@@ -48,26 +64,27 @@ export function requireAuth(ctx: Ctx, ...kinds: Kind[]) {
 
 /**
  * Same as [requireAuth], but also accepts `?token=` for browser WebSockets, which
- * cannot set an Authorization header. Used by `/ws/relay`; prefer the header when
- * the client supports it, since query strings can end up in proxy logs.
+ * cannot set an Authorization header. Used by `/ws/relay`; prefer same-origin
+ * panel session cookies or the Authorization header when supported.
  */
 export function requireAuthQuery(ctx: Ctx, ...kinds: Kind[]) {
   return async (req: FastifyRequest) => {
-    const token = (req.query as { token?: unknown } | undefined)?.token;
-    const header = typeof token === "string" && token.length > 0 ? `Bearer ${token}` : req.headers.authorization;
-    const p = await ctx.auth.authenticate(header);
+    const rawToken = (req.query as { token?: unknown } | undefined)?.token;
+    const token = typeof rawToken === "string" && rawToken.length > 0 ? rawToken : undefined;
+    const p = await authenticateRequest(ctx, req, token);
     if (!kinds.includes(p.kind)) throw forbidden(`This endpoint is not available to ${p.kind} credentials`);
     req.principal = p;
   };
 }
 
 /**
- * The tenant's API key only: pairing phones and revoking them need it. A short-lived
- * agent token (`at_…`) must not be able to mint a credential that outlives it.
+ * The tenant's API key (or self-hosted panel session) only: pairing phones, revoking
+ * them, and managing panel credentials need it. A short-lived agent token (`at_…`)
+ * must not be able to mint a credential that outlives it.
  */
 export function requireAgentKey(ctx: Ctx) {
   return async (req: FastifyRequest) => {
-    const p = await ctx.auth.authenticate(req.headers.authorization);
+    const p = await authenticateRequest(ctx, req);
     if (p.kind !== "agent") throw forbidden(`This endpoint is not available to ${p.kind} credentials`);
     if (p.expiresAt !== undefined) throw forbidden("This endpoint needs the API key, not a short-lived agent token");
     req.principal = p;
