@@ -358,10 +358,76 @@ dialog::backdrop { background: rgba(2, 6, 12, 0.72); backdrop-filter: blur(4px);
   .hero { flex-direction: column; align-items: flex-start; }
 }
 @media (max-width: 560px) {
-  .topbar { align-items: flex-start; flex-direction: column; }
-  .top-actions { width: 100%; justify-content: flex-start; }
+  .topbar { align-items: flex-start; flex-direction: column; padding-top: calc(14px + env(safe-area-inset-top, 0px)); padding-bottom: 14px; }
+  .top-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; gap: 8px; }
+  .top-actions button, .top-actions .ghost { min-height: 44px; padding: 10px 14px; font-size: 13px; }
   .stats { grid-template-columns: 1fr; }
   .panel { padding: 17px; }
-  .hero h1 { font-size: 36px; }
+  .hero h1 { font-size: 30px; }
   .alert { padding: 13px; }
+  .hero-actions { flex-direction: column; width: 100%; }
+  .hero-actions button { width: 100%; }
+  .login-card { padding: 24px 20px; border-radius: 20px; }
+  .login-card h1 { font-size: 26px; }
+  .qr-wrap { min-height: 260px; }
+  .qr-wrap img { width: 240px; }
+  .dialog-actions { flex-direction: column; }
+  .dialog-actions button { width: 100%; }
+  .channel-row { flex-direction: column; gap: 4px; }
+  .channel-row code { text-align: left; }
+  .filters { gap: 6px; }
+  .chip { min-height: 36px; padding: 6px 10px; }
+  .alert-actions { flex-wrap: wrap; }
+  .alert-actions button { flex: 1 1 auto; min-height: 40px; }
+  .empty { padding: 32px 12px; }
+  .empty img { width: 48px; }
+}
+
+/* Touch targets y safe areas para todos los dispositivos móviles */
+@media (max-width: 768px) {
+  input, select, textarea { font-size: 16px; }
+  .topbar { padding-left: calc(18px + env(safe-area-inset-left, 0px)); padding-right: calc(18px + env(safe-area-inset-right, 0px)); }
+  main { padding-left: calc(18px + env(safe-area-inset-left, 0px)); padding-right: calc(18px + env(safe-area-inset-right, 0px)); padding-bottom: calc(70px + env(safe-area-inset-bottom, 0px)); }
+  .hero { gap: 16px; margin: 16px 0 24px; }
+  .hero p { font-size: 15px; }
+  .stat strong { font-size: 26px; }
+  .panel h2 { font-size: 19px; }
+  .alert-title { font-size: 16px; }
+  .alert-message { font-size: 13px; }
+  button.primary, button.secondary, button.ghost { min-height: 44px; }
+  .pill { min-height: 36px; padding: 6px 10px; }
+}
+
+/* Optimización para pantallas muy pequeñas (iPhone SE, etc.) */
+@media (max-width: 380px) {
+  .topbar { padding: 12px 12px; }
+  main { padding: 20px 12px 60px; }
+  .hero h1 { font-size: 26px; }
+  .stat strong { font-size: 22px; }
+  .stat { padding: 14px 16px; }
+  .panel { padding: 14px; border-radius: 16px; }
+  .login-card { padding: 20px 16px; }
+  .login-card h1 { font-size: 22px; }
+  .filters { gap: 4px; }
+  .chip { font-size: 11px; padding: 5px 8px; }
+  .alert { padding: 10px; gap: 10px; }
+  .alert-title { font-size: 15px; }
+  .alert-message { font-size: 12px; }
+  .brand-name { font-size: 15px; }
+  .brand-logo { width: 30px; height: 30px; }
+  .small-brand .brand-logo { width: 28px; height: 28px; }
+  .small-brand .brand-name { font-size: 15px; }
+}
+
+/* Scroll suave y mejor touch en móvil */
+@media (hover: none) and (pointer: coarse) {
+  body { -webkit-overflow-scrolling: touch; }
+  button, .chip, .alert-actions button { touch-action: manipulation; }
+  * { -webkit-tap-highlight-color: transparent; }
+}
+
+/* iOS safe area y PWA fullscreen */
+@supports (padding: env(safe-area-inset-top)) {
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  .topbar { padding-top: calc(14px + env(safe-area-inset-top)); }
 }
